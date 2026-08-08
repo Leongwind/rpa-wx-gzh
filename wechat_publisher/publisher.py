@@ -50,6 +50,15 @@ class AutoPublisher:
 
         effective_article = replace(article, publish=False) if mode == "draft" else article
 
+        has_cover = effective_article.cover_image or (effective_article.assets[0].path if effective_article.assets else None)
+        if effective_article.publish and confirm_publish and has_cover is None:
+            return PublishResult(
+                PublishStatus.FAILED,
+                "none",
+                "正式发布前必须提供封面图片，或至少提供一张可作为封面的正文图片",
+                error_code="cover_required",
+            )
+
         if mode in {"auto", "api", "draft"} and self.api is not None:
             result = self.api.publish(effective_article, confirm_publish=confirm_publish)
             if mode in {"api", "draft"} or result.status in {

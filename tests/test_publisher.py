@@ -39,3 +39,16 @@ def test_auto_provider_does_not_fallback_after_unknown_submission(tmp_path: Path
     )
     assert result.status is PublishStatus.UNKNOWN
     assert result.provider == "api"
+
+
+def test_real_publish_without_cover_fails_before_provider_calls():
+    class ExplodingProvider:
+        def publish(self, *args, **kwargs):
+            raise AssertionError("provider must not be called")
+
+    article = Article.from_dict({"title": "无封面", "body": "正文", "publish": True})
+    publisher = AutoPublisher(api=ExplodingProvider(), browser=ExplodingProvider())
+    result = publisher.publish(article, mode="auto", confirm_publish=True)
+
+    assert result.status is PublishStatus.FAILED
+    assert result.error_code == "cover_required"

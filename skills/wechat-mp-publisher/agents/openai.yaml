@@ -1,4 +1,4 @@
 interface:
   display_name: "WeChat MP Publisher"
-  short_description: "Create drafts or publish WeChat Official Account articles"
-  default_prompt: "Publish the supplied WeChat Official Account article JSON, using the official API when configured and otherwise the isolated Playwright browser session. Show any login or publish-verification QR as an in-conversation card, monitor the scan automatically, and report only verified results."
+  short_description: "Create dynamic WeChat article drafts or publications"
+  default_prompt: "Turn the user's requested title, body, and local or attached images into a WeChat Official Account article. Create a draft by default; publish only after explicit confirmation, using the official API when configured or the isolated Playwright session otherwise. Show QR codes in the conversation and report only verified results."

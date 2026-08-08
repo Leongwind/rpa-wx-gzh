@@ -1,55 +1,101 @@
 ---
 name: wechat-mp-publisher
-description: Publish a WeChat Official Account article from structured JSON. Use when the user asks to create a draft or publish a public-account article with local images. Prefer the official API when WX_APPID/WX_APPSECRET are configured; otherwise use the Playwright persistent browser session and surface any QR-code scan step to the user.
+description: Create a WeChat Official Account article from the user's current request, local files, or conversation attachments, then create a draft or publish it through the official API or isolated Playwright session. Use when the user asks to write, draft, send, or publish a public-account article.
 ---
 
 # WeChat Official Account Publisher
 
-Use the repository publisher rather than editing the legacy Selenium flow.
+Use the repository's API/Playwright publisher. Do not call the legacy Selenium
+flow in `main.py` or `modules/login.py`.
 
-## Workflow
+## Build the article from the current request
 
-1. Validate the article JSON before opening a browser or calling an external API.
-2. Use `python -m wechat_publisher publish --input <file> --mode auto --confirm-publish` for a real publication. The command returns a `run_id`; keep it for status, resume, or cancel. Omit `--confirm-publish` for validation or draft-only work.
-3. Keep `WX_APPID` and `WX_APPSECRET` in the environment only. Never put them in article JSON, logs, skill files, or chat output.
-4. If the result is `awaiting_scan`, render `qrcode_path` as an in-conversation image using its absolute path. Show a compact card with the article title, `stage`, `next_action`, and the `expires_at` countdown. Tell the user to scan the displayed QR; the isolated Chrome window is a fallback and diagnostics surface. Do not ask the user to find a file or run `resume` manually.
-5. If the result is `unknown`, do not retry through another provider: the API may already have accepted the publication.
+The article is supplied by the user; never reuse `article.acceptance.json`, a
+fixed title/body, or the `test_pic` directory as implicit input.
 
-## Article input
+1. Extract the title, body, requested format, digest, cover, and images from the
+   current request. The title and non-empty body are required. Ask for the
+   title if it is missing. Use Markdown when no format is specified.
+2. For an omitted digest, let the publisher derive one from the cleaned first
+   120 characters of the body. An explicitly supplied digest always wins.
+3. Resolve local files and conversation attachments to absolute paths. If no
+   cover is specified, use the first supplied image as the cover. Do not
+   download network URLs in this version.
+4. Do not insert attached images into the body merely because they exist. Add
+   a body image only when the user specifies its position with
+   `{{asset:name}}` or Markdown such as `![说明]({{asset:name}})`; declare the
+   matching asset with its absolute path.
+5. Write the normalized payload to an ignored temporary path such as
+   `playwright_data/inputs/<unique-id>.json`. Do not put user content,
+   credentials, or generated inputs in the Skill directory or Git history.
+
+Payload shape:
 
 ```json
 {
-  "title": "文章标题",
-  "body": "正文，可使用 {{asset:image1}}",
+  "title": "用户提供的标题",
+  "body": "用户提供的正文，可使用 {{asset:image1}}",
   "body_format": "markdown",
-  "digest": "摘要",
+  "digest": "可选摘要",
   "cover_image": "/absolute/path/cover.png",
   "assets": [{"alias": "image1", "path": "/absolute/path/image1.png"}],
-  "publish": true
+  "publish": false
 }
 ```
 
-Supported `body_format` values are `markdown` and `html`. All referenced asset aliases must be declared and point to existing local files.
+When the user only asks to write or prepare an article, set `publish` to
+`false` and use draft mode. Only an explicit request to publish/send, followed
+by confirmation of the external side effect, may set `publish` to `true` and
+pass `--confirm-publish`.
 
-## Result handling
+## Run and report
 
-- `published`: report the publication as successful.
-- `draft_created`: report the draft ID and state that it was not publicly published.
-- `awaiting_scan`: show the current QR card and stage. A background watcher automatically checks the existing browser session for scan success; the session remains resumable through `run_id`.
-- `verification_expired`: explain that the current verification challenge expired after the allowed refresh; keep the `run_id` and do not resubmit the article automatically.
-- `failed`: report the error code and message.
-- `unknown`: stop and ask the user to verify the publication in the Official Account console before retrying.
-
-## Recovering a verification session
-
-The browser publisher uses the isolated `WX_PLAYWRIGHT_PROFILE` directory and a local run registry under `playwright_data/sessions/`. It does not reuse the user's normal Chrome profile. If the initial command times out while the verification window is still open:
+Use the active Anaconda environment and the generated input:
 
 ```bash
-python -m wechat_publisher status --run-id <run_id> --json
-python -m wechat_publisher resume --run-id <run_id> --json
-python -m wechat_publisher cancel --run-id <run_id> --json
+python -m wechat_publisher publish \
+  --input playwright_data/inputs/<unique-id>.json \
+  --mode auto \
+  --json
 ```
 
-`resume` reattaches to the existing profile-owned Chrome window. `cancel` closes that window and marks the run cancelled. The publisher refreshes only the current verification challenge once after expiry; it never clicks “发表” again or resubmits the article. Never reuse an old QR image from a previous run; every QR uses the run ID and generation in its filename.
+For a confirmed real publication, add `--confirm-publish`. For an explicit
+draft request, use `--mode draft`. The CLI also accepts `--input -` when a
+caller supplies the JSON through standard input.
 
-The scan stages are `login`, `publish_verification`, and `admin_approval`. Treat `admin_approval` as waiting for the administrator, not as a failure. Only an explicit `published` result is a successful publication.
+If the result is `awaiting_scan`, render the absolute `qrcode_path` as an
+in-conversation image card. Show the article title, scan stage, next action,
+and expiry countdown; tell the user to scan that card. The isolated Chrome
+window is only a fallback and diagnostics surface. The background watcher
+checks the scan automatically.
+
+Handle results as follows:
+
+- `published`: report success only when the publisher explicitly verified it.
+- `draft_created`: report the draft result and that it was not publicly sent.
+- `awaiting_scan`: show the current QR card; do not ask the user to locate a
+  file or manually run `resume`.
+- `admin_approval`: keep reporting that administrator confirmation is pending.
+- `verification_expired`: keep the `run_id`; do not resubmit automatically.
+- `unknown`: stop and ask the user to verify the Official Account console
+  before any retry.
+- `failed`: report the error code and actionable message.
+
+## Session recovery and secrets
+
+The isolated profile is `WX_PLAYWRIGHT_PROFILE` (default
+`playwright_data/`). QR files, cookies, run records, and temporary article
+inputs stay there and are ignored by Git. Credentials come only from
+`WX_APPID` and `WX_APPSECRET` in the environment; never print or persist them.
+
+Public recovery commands are:
+
+```bash
+python -m wechat_publisher status --run-id <run-id> --json
+python -m wechat_publisher resume --run-id <run-id> --json
+python -m wechat_publisher cancel --run-id <run-id> --json
+```
+
+The publisher uses unique QR files per `run_id` and generation, refreshes only
+the current verification challenge once after expiry, and never clicks
+`发表` again to resubmit an already submitted article.

@@ -40,3 +40,32 @@ def test_render_browser_html_uses_local_file_uri(tmp_path: Path):
     article = make_article(tmp_path)
     result = render_browser_html(article)
     assert "file://" in result
+
+
+def test_article_derives_digest_and_uses_first_asset_as_cover(tmp_path: Path):
+    image = tmp_path / "attached.png"
+    image.write_bytes(b"png")
+    article = Article.from_dict(
+        {
+            "title": "动态标题",
+            "body": "# 动态标题\n\n这是用户提供的正文。\n\n{{asset:attached}}",
+            "assets": [{"alias": "attached", "path": str(image)}],
+        }
+    )
+
+    assert article.cover_image == image.resolve()
+    assert article.digest.startswith("动态标题 这是用户提供的正文")
+
+
+def test_asset_is_not_inserted_without_an_explicit_body_reference(tmp_path: Path):
+    image = tmp_path / "attached.png"
+    image.write_bytes(b"png")
+    article = Article.from_dict(
+        {
+            "title": "只有封面",
+            "body": "正文没有图片占位符",
+            "assets": [{"alias": "attached", "path": str(image)}],
+        }
+    )
+
+    assert "<img" not in render_browser_html(article)

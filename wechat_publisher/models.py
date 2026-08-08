@@ -91,11 +91,15 @@ class Article:
         if missing:
             raise ValidationError(f"正文引用了未声明的 asset: {', '.join(missing)}")
 
+        digest = str(value.get("digest", "") or "").strip() or derive_digest(body)
+        if cover_image is None and assets:
+            cover_image = assets[0].path
+
         return cls(
             title=title,
             body=body,
             body_format=body_format,
-            digest=str(value.get("digest", "") or "").strip(),
+            digest=digest,
             cover_image=cover_image,
             assets=assets,
             publish=bool(value.get("publish", True)),
@@ -168,3 +172,22 @@ def _asset_references(body: str) -> set[str]:
     import re
 
     return set(re.findall(r"\{\{asset:([A-Za-z0-9_.-]+)\}\}", body))
+
+
+def derive_digest(body: str, *, limit: int = 120) -> str:
+    """Create a short WeChat digest without changing the article body.
+
+    The digest is only a default for callers that omit one. Markdown image
+    markers, asset tokens, HTML tags, and formatting punctuation are removed
+    so the result remains readable in the article list.
+    """
+    import html
+    import re
+
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", body)
+    text = re.sub(r"\{\{asset:[A-Za-z0-9_.-]+\}\}", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[#*_`~>\[\]()]+", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]

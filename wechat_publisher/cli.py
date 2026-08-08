@@ -16,7 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="微信公众号文章发布器")
     subparsers = parser.add_subparsers(dest="command", required=True)
     publish = subparsers.add_parser("publish", help="发布或创建公众号文章草稿")
-    publish.add_argument("--input", required=True, type=Path, help="文章 JSON 文件")
+    publish.add_argument("--input", required=True, type=Path, help="文章 JSON 文件；传 - 从标准输入读取")
     publish.add_argument("--mode", choices=["auto", "api", "browser", "draft"], default="auto")
     publish.add_argument("--confirm-publish", action="store_true", help="允许产生真实发布副作用")
     publish.add_argument("--json", action="store_true", help="只输出 JSON 结果")
@@ -75,7 +75,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "publish":
         return 2
     try:
-        article = Article.from_json_file(args.input)
+        if str(args.input) == "-":
+            try:
+                payload = json.load(sys.stdin)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValidationError(f"无法从标准输入读取文章 JSON: {exc}") from exc
+            article = Article.from_dict(payload)
+        else:
+            article = Article.from_json_file(args.input)
     except ValidationError as exc:
         result = {"status": PublishStatus.FAILED.value, "error_code": "invalid_article", "message": str(exc)}
         print(json.dumps(result, ensure_ascii=False))
