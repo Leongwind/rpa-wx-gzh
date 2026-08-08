@@ -1,0 +1,18 @@
+# Local secrets and browser state
+.env
+.venv/
+playwright_data/
+browser_data/
+*.sqlite
+
+# CodeGraph index is local-only
+.codegraph/
+.codegraph-*/
+
+# Runtime artifacts
+logs/
+wechat_*_qrcode.png
+wechat_*_full.png
+__pycache__/
+**/__pycache__/
+.pytest_cache/
