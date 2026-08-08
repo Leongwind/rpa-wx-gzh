@@ -59,8 +59,10 @@ class Article:
         if not isinstance(value, Mapping):
             raise ValidationError("文章输入必须是 JSON 对象")
 
-        title = str(value.get("title", "")).strip()
-        body = str(value.get("body", ""))
+        title_value = value.get("title", "")
+        body_value = value.get("body", "")
+        title = str(title_value).strip() if title_value is not None else ""
+        body = str(body_value) if body_value is not None else ""
         body_format = str(value.get("body_format", "markdown")).lower().strip()
         if not title:
             raise ValidationError("title 不能为空")

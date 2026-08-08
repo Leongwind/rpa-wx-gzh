@@ -106,7 +106,7 @@ python main.py --browser edge --user-data-dir "D:\rpa-wx-gzh\browser_data"
 项目新增 `wechat_publisher` 包和 `skills/wechat-mp-publisher` Skill。新版优先使用微信公众号开放接口；未配置 `WX_APPID` / `WX_APPSECRET` 时使用 Playwright 持久化浏览器会话，首次登录或发布验证仍可能需要用户扫码。
 
 ```bash
-conda env create -f environment.yml
+conda env create --override-channels -f environment.yml
 conda activate rpa-wx-gzh
 playwright install chromium
 
