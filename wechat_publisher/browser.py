@@ -301,6 +301,15 @@ class BrowserPublisher:
 
     def _click_publish_confirmation_once(self, page: Any) -> bool:
         """Click the green publish action in the final publish modal."""
+        buttons = page.locator("button")
+        for index in range(buttons.count() - 1, -1, -1):
+            button = buttons.nth(index)
+            try:
+                if "继续发表" in button.inner_text(timeout=200) and button.is_visible(timeout=200):
+                    button.click(force=True)
+                    return True
+            except Exception:
+                continue
         continue_publish = page.get_by_text("继续发表", exact=True)
         try:
             if continue_publish.count() > 0 and continue_publish.last.is_visible(timeout=500):
