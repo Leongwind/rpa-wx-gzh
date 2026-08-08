@@ -44,6 +44,7 @@ class BrowserPublisher:
         scan_timeout: float = 120.0,
         poll_interval: float = 1.0,
         browser_type: str = "chromium",
+        executable_path: Optional[str] = None,
     ) -> None:
         self.profile_dir = Path(profile_dir).expanduser().resolve()
         self.base_url = base_url
@@ -51,6 +52,7 @@ class BrowserPublisher:
         self.scan_timeout = scan_timeout
         self.poll_interval = poll_interval
         self.browser_type = browser_type
+        self.executable_path = executable_path
 
     def _import_playwright(self) -> Any:
         try:
@@ -232,10 +234,15 @@ class BrowserPublisher:
         output_dir = self.profile_dir / "artifacts"
         with sync_playwright() as playwright:
             browser_launcher = getattr(playwright, self.browser_type, playwright.chromium)
+            launch_options = {
+                "user_data_dir": str(self.profile_dir),
+                "headless": self.headless,
+                "viewport": {"width": 1440, "height": 1000},
+            }
+            if self.executable_path:
+                launch_options["executable_path"] = self.executable_path
             context = browser_launcher.launch_persistent_context(
-                user_data_dir=str(self.profile_dir),
-                headless=self.headless,
-                viewport={"width": 1440, "height": 1000},
+                **launch_options,
             )
             page = context.pages[0] if context.pages else context.new_page()
             try:

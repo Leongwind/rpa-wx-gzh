@@ -1,0 +1,9 @@
+{
+  "title": "公众号自动化验收测试文章",
+  "body": "这是一篇用于验收微信公众号自动发布流程的测试文章。\n\n本文章由项目的 Playwright 发布器创建，仅用于验证登录、编辑、发布确认和扫码状态检测。",
+  "body_format": "markdown",
+  "digest": "微信公众号自动发布流程验收测试",
+  "cover_image": "test_pic/微信截图_20250312100201.png",
+  "assets": [],
+  "publish": true
+}

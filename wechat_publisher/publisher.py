@@ -29,6 +29,7 @@ class AutoPublisher:
             base_url=os.getenv("WX_MP_URL", BrowserPublisher.BASE_URL),
             headless=os.getenv("WX_HEADLESS", "0").lower() in {"1", "true", "yes"},
             scan_timeout=float(os.getenv("WX_SCAN_TIMEOUT", "120")),
+            executable_path=os.getenv("WX_PLAYWRIGHT_EXECUTABLE_PATH") or None,
         )
         return cls(api=api, browser=browser)
 

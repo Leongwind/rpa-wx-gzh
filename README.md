@@ -117,3 +117,5 @@ python -m wechat_publisher publish \
 ```
 
 文章 JSON 使用 `title`、`body`、`body_format`、`cover_image` 和 `assets` 字段。正文图片使用 `{{asset:alias}}` 引用。浏览器会话默认保存在 `playwright_data/`，凭证通过环境变量提供，不要提交到仓库。
+
+如果系统已经安装 Chrome，可设置 `WX_PLAYWRIGHT_EXECUTABLE_PATH` 指向浏览器程序，跳过 Playwright 浏览器下载。
