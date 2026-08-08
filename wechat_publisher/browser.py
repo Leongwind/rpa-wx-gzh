@@ -108,15 +108,24 @@ class BrowserPublisher:
     def _capture_publish_qrcode(self, page: Any, output_dir: Path) -> Optional[str]:
         """Capture a publish verification QR, including canvas-based dialogs."""
         output_dir.mkdir(parents=True, exist_ok=True)
-        dialog = page.locator(".dialog_wrp, [role='dialog'], .weui-desktop-dialog").filter(has_text=re.compile("微信验证|扫码|二维码|发表|发布"))
+        dialog = page.locator(".dialog_wrp, [role='dialog'], .weui-desktop-dialog").filter(has_text=re.compile("微信验证|扫码|二维码|安全验证|安全"))
+        has_verification_dialog = False
         try:
             if dialog.first.is_visible(timeout=500):
+                has_verification_dialog = True
                 path = output_dir / "wechat_publish_qrcode.png"
                 dialog.first.screenshot(path=str(path), animations="disabled")
                 self._enlarge_qrcode(path)
                 return str(path)
         except Exception:
             pass
+        if not has_verification_dialog:
+            try:
+                body = page.locator("body").inner_text(timeout=500)
+                if not re.search(r"微信验证|扫码验证|二维码验证|请使用微信扫码", body):
+                    return None
+            except Exception:
+                return None
         for selector in self.PUBLISH_QR_SELECTORS:
             locator = page.locator(selector).first
             try:
@@ -313,7 +322,7 @@ class BrowserPublisher:
         continue_publish = page.get_by_text("继续发表", exact=True)
         try:
             if continue_publish.count() > 0 and continue_publish.last.is_visible(timeout=500):
-                continue_publish.last.click()
+                continue_publish.last.evaluate("node => node.click()")
                 return True
         except Exception:
             pass
@@ -494,6 +503,20 @@ class BrowserPublisher:
                         error_code="publish_confirmation_missing",
                     )
                 page.wait_for_timeout(1000)
+                remaining_continue = page.get_by_text("继续发表", exact=True)
+                if remaining_continue.count() > 0 and remaining_continue.last.is_visible(timeout=500):
+                    screenshot = output_dir / "wechat_publish_confirmation_stuck.png"
+                    try:
+                        page.screenshot(path=str(screenshot), full_page=True)
+                    except Exception:
+                        screenshot = None
+                    return PublishResult(
+                        PublishStatus.FAILED,
+                        "browser",
+                        "继续发表弹窗未关闭，已阻止捕获二维码",
+                        qrcode_path=str(screenshot) if screenshot else None,
+                        error_code="continue_publish_stuck",
+                    )
                 qrcode_path = None
                 for candidate in reversed(context.pages):
                     qrcode_path = self._capture_publish_qrcode(candidate, output_dir)
