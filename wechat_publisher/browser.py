@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -57,6 +59,8 @@ class BrowserPublisher:
         headless: bool = False,
         scan_timeout: float = 120.0,
         poll_interval: float = 1.0,
+        qr_ttl: float = 120.0,
+        qr_refresh_limit: int = 1,
         browser_type: str = "chromium",
         executable_path: Optional[str] = None,
     ) -> None:
@@ -65,6 +69,8 @@ class BrowserPublisher:
         self.headless = headless
         self.scan_timeout = scan_timeout
         self.poll_interval = poll_interval
+        self.qr_ttl = qr_ttl
+        self.qr_refresh_limit = max(0, int(qr_refresh_limit))
         self.browser_type = browser_type
         self.executable_path = executable_path
 
@@ -172,19 +178,39 @@ class BrowserPublisher:
             pass
         return locators
 
-    def _capture_qrcode(self, page: Any, output_dir: Path, name: str) -> Optional[str]:
+    @staticmethod
+    def _qr_artifact(output_dir: Path, prefix: str, run_id: Optional[str], generation: int) -> Path:
+        safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", run_id or "session")
+        return output_dir / f"{prefix}_{safe_run_id}_{max(1, generation)}.png"
+
+    def _capture_qrcode(
+        self,
+        page: Any,
+        output_dir: Path,
+        prefix: str,
+        *,
+        run_id: Optional[str] = None,
+        generation: int = 1,
+    ) -> Optional[str]:
         output_dir.mkdir(parents=True, exist_ok=True)
         for locator in self._qr_locators(page):
             try:
                 if locator.is_visible(timeout=500):
-                    path = output_dir / name
+                    path = self._qr_artifact(output_dir, prefix, run_id, generation)
                     locator.screenshot(path=str(path))
                     return str(path)
             except Exception:
                 continue
         return None
 
-    def _capture_publish_qrcode(self, page: Any, output_dir: Path) -> Optional[str]:
+    def _capture_publish_qrcode(
+        self,
+        page: Any,
+        output_dir: Path,
+        *,
+        run_id: Optional[str] = None,
+        generation: int = 1,
+    ) -> Optional[str]:
         """Capture a publish verification QR, including canvas-based dialogs."""
         output_dir.mkdir(parents=True, exist_ok=True)
         dialog = page.locator(".dialog_wrp, [role='dialog'], .weui-desktop-dialog").filter(has_text=re.compile("微信验证|扫码|二维码|安全验证|安全"))
@@ -192,7 +218,7 @@ class BrowserPublisher:
         try:
             if dialog.first.is_visible(timeout=500):
                 has_verification_dialog = True
-                path = output_dir / "wechat_publish_qrcode.png"
+                path = self._qr_artifact(output_dir, "wechat_publish_qrcode", run_id, generation)
                 dialog.first.screenshot(path=str(path), animations="disabled")
                 self._enlarge_qrcode(path)
                 return str(path)
@@ -209,7 +235,7 @@ class BrowserPublisher:
             locator = page.locator(selector).first
             try:
                 if locator.is_visible(timeout=500):
-                    path = output_dir / "wechat_publish_qrcode.png"
+                    path = self._qr_artifact(output_dir, "wechat_publish_qrcode", run_id, generation)
                     locator.screenshot(path=str(path))
                     self._enlarge_qrcode(path)
                     return str(path)
@@ -219,7 +245,7 @@ class BrowserPublisher:
             frame = page.locator(selector).first
             try:
                 if frame.is_visible(timeout=500):
-                    path = output_dir / "wechat_publish_qrcode.png"
+                    path = self._qr_artifact(output_dir, "wechat_publish_qrcode", run_id, generation)
                     frame.screenshot(path=str(path))
                     self._enlarge_qrcode(path)
                     return str(path)
@@ -242,7 +268,55 @@ class BrowserPublisher:
             # is unavailable; the original screenshot remains usable.
             return
 
-    def _wait_for_login(self, page: Any, qrcode_path: Optional[str]) -> PublishResult | None:
+    @staticmethod
+    def _scan_stage(body: str, *, default: str = "publish_verification") -> str:
+        if re.search(r"管理员.*(?:验证|确认)|等待管理员|管理员微信", body):
+            return "admin_approval"
+        if re.search(r"微信验证|扫码验证|二维码验证|请使用微信扫码", body):
+            return "publish_verification"
+        return default
+
+    @staticmethod
+    def _next_action(stage: str) -> str:
+        return {
+            "login": "请使用运营者微信扫码登录",
+            "publish_verification": "请使用微信扫码验证发布",
+            "admin_approval": "请等待管理员微信确认",
+        }.get(stage, "请查看当前 Chrome 验证窗口")
+
+    def _scan_result(
+        self,
+        message: str,
+        *,
+        stage: str,
+        qrcode_path: Optional[str],
+        run_id: Optional[str],
+        generation: int = 1,
+        expires_at: Optional[float] = None,
+        error_code: Optional[str] = "publish_scan_timeout",
+    ) -> PublishResult:
+        return PublishResult(
+            PublishStatus.AWAITING_SCAN,
+            "browser",
+            message,
+            qrcode_path=qrcode_path,
+            error_code=error_code,
+            run_id=run_id,
+            stage=stage,
+            expires_at=expires_at,
+            generation=generation,
+            next_action=self._next_action(stage),
+        )
+
+    def _wait_for_login(
+        self,
+        page: Any,
+        qrcode_path: Optional[str],
+        *,
+        run_id: Optional[str] = None,
+        generation: int = 1,
+        expires_at: Optional[float] = None,
+    ) -> PublishResult | None:
         deadline = time.monotonic() + self.scan_timeout
         while time.monotonic() < deadline:
             if self._logged_in(page):
@@ -260,27 +334,64 @@ class BrowserPublisher:
                     "登录二维码已过期",
                     qrcode_path=qrcode_path,
                     error_code="login_qrcode_expired",
+                    run_id=run_id,
+                    stage="login",
+                    expires_at=expires_at,
+                    generation=generation,
+                    next_action="请重新生成登录二维码",
                 )
             time.sleep(self.poll_interval)
-        return PublishResult(
-            PublishStatus.AWAITING_SCAN,
-            "browser",
+        return self._scan_result(
             "等待用户扫码登录超时，浏览器会话已保留",
+            stage="login",
             qrcode_path=qrcode_path,
+            run_id=run_id,
+            generation=generation,
+            expires_at=expires_at,
             error_code="login_scan_timeout",
         )
 
-    def _ensure_login(self, page: Any, output_dir: Path) -> Optional[PublishResult]:
+    def _ensure_login(
+        self,
+        page: Any,
+        output_dir: Path,
+        *,
+        run_id: Optional[str] = None,
+    ) -> Optional[PublishResult]:
         page.goto(self.base_url, wait_until="domcontentloaded")
         if self._logged_in(page):
             return None
         qrcode_path = None
+        generation = 1
         qr_deadline = time.monotonic() + 10
         while time.monotonic() < qr_deadline and not qrcode_path:
-            qrcode_path = self._capture_qrcode(page, output_dir, "wechat_login_qrcode.png")
+            qrcode_path = self._capture_qrcode(
+                page,
+                output_dir,
+                "wechat_login_qrcode",
+                run_id=run_id,
+                generation=generation,
+            )
             if not qrcode_path:
                 time.sleep(0.5)
-        return self._wait_for_login(page, qrcode_path)
+        expires_at = time.time() + self.qr_ttl if qrcode_path else None
+        if run_id and qrcode_path:
+            return self._scan_result(
+                "请使用运营者微信扫描登录二维码",
+                stage="login",
+                qrcode_path=qrcode_path,
+                run_id=run_id,
+                generation=generation,
+                expires_at=expires_at,
+                error_code="login_scan_pending",
+            )
+        return self._wait_for_login(
+            page,
+            qrcode_path,
+            run_id=run_id,
+            generation=generation,
+            expires_at=expires_at,
+        )
 
     def _fill_article(self, page: Any, article: Article) -> None:
         title = page.locator("div[name='title'] .ProseMirror[contenteditable='true']")
@@ -498,15 +609,61 @@ class BrowserPublisher:
                 continue
         return False
 
-    def _wait_for_publish_qrcode(self, context: Any, page: Any, output_dir: Path) -> tuple[Any, Optional[str]]:
+    def _wait_for_publish_qrcode(
+        self,
+        context: Any,
+        page: Any,
+        output_dir: Path,
+        *,
+        run_id: Optional[str] = None,
+        generation: int = 1,
+    ) -> tuple[Any, Optional[str]]:
         """Wait until the post-confirmation verification UI actually exists."""
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             for candidate in reversed(context.pages):
-                qrcode_path = self._capture_publish_qrcode(candidate, output_dir)
+                qrcode_path = self._capture_publish_qrcode(
+                    candidate,
+                    output_dir,
+                    run_id=run_id,
+                    generation=generation,
+                )
                 if qrcode_path:
                     return candidate, qrcode_path
             page.wait_for_timeout(300)
+        return page, None
+
+    def _refresh_publish_qrcode(
+        self,
+        context: Any,
+        page: Any,
+        output_dir: Path,
+        *,
+        run_id: str,
+        generation: int,
+    ) -> tuple[Any, Optional[str]]:
+        """Refresh only the current verification challenge after expiry."""
+        refresh_texts = ("重新获取二维码", "刷新二维码", "重新生成二维码")
+        for text in refresh_texts:
+            candidates = [
+                page.get_by_role("button", name=text, exact=True),
+                page.get_by_text(text, exact=True),
+            ]
+            for locator in candidates:
+                for index in range(locator.count() - 1, -1, -1):
+                    candidate = locator.nth(index)
+                    try:
+                        if candidate.is_visible(timeout=300):
+                            candidate.click(force=True)
+                            return self._wait_for_publish_qrcode(
+                                context,
+                                page,
+                                output_dir,
+                                run_id=run_id,
+                                generation=generation + 1,
+                            )
+                    except Exception:
+                        continue
         return page, None
 
     def _open_article_editor(self, context: Any, page: Any) -> Any:
@@ -528,22 +685,93 @@ class BrowserPublisher:
             page.wait_for_timeout(500)
         return page
 
-    def _wait_for_final_result(self, page: Any, qrcode_path: Optional[str]) -> PublishResult:
+    def _wait_for_final_result(
+        self,
+        page: Any,
+        qrcode_path: Optional[str],
+        *,
+        context: Any = None,
+        store: Optional[RunStore] = None,
+        run_id: Optional[str] = None,
+        generation: int = 1,
+        expires_at: Optional[float] = None,
+        output_dir: Optional[Path] = None,
+    ) -> PublishResult:
         deadline = time.monotonic() + self.scan_timeout
         observed_dialog = False
         grace_deadline = time.monotonic() + 10
+        current_stage = "publish_verification"
+        refresh_count = max(0, generation - 1)
+        last_recorded_stage: Optional[str] = None
         while time.monotonic() < deadline:
             body = page.locator("body").inner_text(timeout=1000)
+            current_stage = self._scan_stage(body)
+            if store and run_id and current_stage != last_recorded_stage:
+                store.update(
+                    run_id,
+                    status=PublishStatus.AWAITING_SCAN.value,
+                    stage=current_stage,
+                    qrcode_path=qrcode_path,
+                    expires_at=expires_at,
+                    generation=generation,
+                    next_action=self._next_action(current_stage),
+                    message=self._next_action(current_stage),
+                )
+                last_recorded_stage = current_stage
             if "二维码已过期" in body or "验证已过期" in body:
+                if (
+                    context is not None
+                    and store is not None
+                    and run_id
+                    and output_dir is not None
+                    and refresh_count < self.qr_refresh_limit
+                ):
+                    refreshed_page, refreshed_qrcode = self._refresh_publish_qrcode(
+                        context,
+                        page,
+                        output_dir,
+                        run_id=run_id,
+                        generation=generation,
+                    )
+                    if refreshed_qrcode:
+                        page = refreshed_page
+                        qrcode_path = refreshed_qrcode
+                        generation += 1
+                        refresh_count += 1
+                        expires_at = time.time() + self.qr_ttl
+                        store.update(
+                            run_id,
+                            status=PublishStatus.AWAITING_SCAN.value,
+                            stage="publish_verification",
+                            qrcode_path=qrcode_path,
+                            expires_at=expires_at,
+                            generation=generation,
+                            next_action=self._next_action("publish_verification"),
+                            message="二维码已刷新，请使用微信扫码验证发布",
+                        )
+                        continue
                 return PublishResult(
                     PublishStatus.VERIFICATION_EXPIRED,
                     "browser",
                     "发布验证二维码已过期",
                     qrcode_path=qrcode_path,
                     error_code="publish_qrcode_expired",
+                    run_id=run_id,
+                    stage=current_stage,
+                    expires_at=expires_at,
+                    generation=generation,
+                    next_action="请重新执行验证，不会重新提交文章",
                 )
             if any(self.SUCCESS_TEXT.search(line.strip()) for line in body.splitlines()):
-                return PublishResult(PublishStatus.PUBLISHED, "browser", "文章发布成功", qrcode_path=qrcode_path)
+                return PublishResult(
+                    PublishStatus.PUBLISHED,
+                    "browser",
+                    "文章发布成功",
+                    qrcode_path=qrcode_path,
+                    run_id=run_id,
+                    stage=current_stage,
+                    generation=generation,
+                )
             dialog = page.locator(".dialog_wrp, [role='dialog']").filter(has_text=re.compile("微信验证|发表|发布"))
             try:
                 dialog_visible = dialog.first.is_visible(timeout=500)
@@ -557,25 +785,214 @@ class BrowserPublisher:
                         "发表弹窗已关闭，但页面没有明确成功标志",
                         qrcode_path=qrcode_path,
                         error_code="publish_status_unconfirmed",
+                        run_id=run_id,
+                        stage=current_stage,
+                        expires_at=expires_at,
+                        generation=generation,
+                        next_action="请在公众号后台确认文章状态，不要重复发布",
                     )
             except Exception:
                 pass
             time.sleep(self.poll_interval)
-        return PublishResult(
-            PublishStatus.AWAITING_SCAN,
-            "browser",
+        return self._scan_result(
             "等待微信发布验证超时，请检查浏览器中的验证状态",
+            stage=current_stage,
             qrcode_path=qrcode_path,
+            run_id=run_id,
+            generation=generation,
+            expires_at=expires_at,
             error_code="publish_scan_timeout",
         )
 
-    def resume(self, run_id: str) -> PublishResult:
-        """Reattach to a timed-out verification window and continue polling."""
+    @staticmethod
+    def _process_alive(pid: Optional[int]) -> bool:
+        if not pid:
+            return False
+        try:
+            os.kill(pid, 0)
+        except (OSError, ProcessLookupError):
+            return False
+        return True
+
+    @staticmethod
+    def _result_from_record(record: Any) -> Optional[PublishResult]:
+        if not record.result:
+            return None
+        payload = record.result
+        try:
+            status = PublishStatus(payload["status"])
+        except (KeyError, ValueError):
+            return None
+        return PublishResult(
+            status,
+            str(payload.get("provider", "browser")),
+            str(payload.get("message", "")),
+            qrcode_path=payload.get("qrcode_path"),
+            draft_id=payload.get("draft_id"),
+            publish_id=payload.get("publish_id"),
+            article_id=payload.get("article_id"),
+            error_code=payload.get("error_code"),
+            run_id=payload.get("run_id", record.run_id),
+            stage=payload.get("stage", record.stage),
+            expires_at=payload.get("expires_at", record.expires_at),
+            generation=payload.get("generation", record.generation),
+            next_action=payload.get("next_action", record.next_action),
+            metadata=payload.get("metadata", {}),
+        )
+
+    def _start_watcher(self, run_id: str) -> Optional[int]:
+        """Start one detached watcher without creating a second publish action."""
+        store = RunStore(self.profile_dir)
+        record = store.load(run_id)
+        if record.watcher_pid and self._process_alive(record.watcher_pid):
+            return record.watcher_pid
+        command = [sys.executable, "-m", "wechat_publisher", "_watch", "--run-id", run_id]
+        process = subprocess.Popen(
+            command,
+            cwd=str(Path(__file__).resolve().parents[1]),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        store.update(
+            run_id,
+            watcher_pid=process.pid,
+            watcher_status="running",
+            monitor_until=time.time() + self.scan_timeout,
+        )
+        return process.pid
+
+    def watch(self, run_id: str) -> PublishResult:
+        """Monitor login or publish verification without submitting again."""
         store = RunStore(self.profile_dir)
         try:
             record = store.load(run_id)
         except (KeyError, ValueError) as exc:
             return PublishResult(PublishStatus.FAILED, "browser", str(exc), error_code="run_not_found", run_id=run_id)
+        own_pid = os.getpid()
+        if record.watcher_pid and record.watcher_pid != own_pid and self._process_alive(record.watcher_pid):
+            return self._result_from_record(record) or self._scan_result(
+                "后台 watcher 正在监测扫码状态",
+                stage=record.stage or "publish_verification",
+                qrcode_path=record.qrcode_path,
+                run_id=run_id,
+                generation=record.generation or 1,
+                expires_at=record.expires_at,
+            )
+        store.update(
+            run_id,
+            watcher_pid=own_pid,
+            watcher_status="running",
+            monitor_until=record.monitor_until or time.time() + self.scan_timeout,
+        )
+        result: Optional[PublishResult] = None
+        browser = None
+        try:
+            sync_playwright = self._import_playwright()
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{record.debug_port}")
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = context.pages[-1] if context.pages else context.new_page()
+                output_dir = self.profile_dir / "artifacts"
+                deadline = record.monitor_until or time.time() + self.scan_timeout
+
+                if record.stage == "login":
+                    while time.time() < deadline:
+                        if self._logged_in(page):
+                            article = store.load_article(run_id)
+                            store.update(run_id, watcher_pid=None, watcher_status="not_started")
+                            return self.publish(article, confirm_publish=article.publish, run_id=run_id)
+                        body = page.locator("body").inner_text(timeout=1000)
+                        if "二维码已过期" in body or "已过期" in body:
+                            result = PublishResult(
+                                PublishStatus.VERIFICATION_EXPIRED,
+                                "browser",
+                                "登录二维码已过期，请重新生成登录二维码",
+                                qrcode_path=record.qrcode_path,
+                                error_code="login_qrcode_expired",
+                                run_id=run_id,
+                                stage="login",
+                                expires_at=record.expires_at,
+                                generation=record.generation,
+                                next_action="请重新执行登录",
+                            )
+                            break
+                        time.sleep(self.poll_interval)
+                    if result is None:
+                        result = self._scan_result(
+                            "等待用户扫码登录超时，浏览器会话已保留",
+                            stage="login",
+                            qrcode_path=record.qrcode_path,
+                            run_id=run_id,
+                            generation=record.generation or 1,
+                            expires_at=record.expires_at,
+                            error_code="login_scan_timeout",
+                        )
+                else:
+                    result_page, qrcode_path = self._wait_for_publish_qrcode(
+                        context,
+                        page,
+                        output_dir,
+                        run_id=run_id,
+                        generation=record.generation or 1,
+                    )
+                    page = result_page
+                    qrcode_path = qrcode_path or record.qrcode_path
+                    result = self._wait_for_final_result(
+                        page,
+                        qrcode_path,
+                        context=context,
+                        store=store,
+                        run_id=run_id,
+                        generation=record.generation or 1,
+                        expires_at=record.expires_at,
+                        output_dir=output_dir,
+                    )
+                result = replace(result, run_id=run_id)
+                store.save_result(run_id, result)
+                if result.status is PublishStatus.PUBLISHED:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                return result
+        except Exception as exc:
+            result = PublishResult(
+                PublishStatus.FAILED,
+                "browser",
+                f"后台扫码监测失败: {exc}",
+                error_code="watcher_error",
+                run_id=run_id,
+            )
+            try:
+                if store.load(run_id).status != "cancelled":
+                    store.save_result(run_id, result)
+            except (KeyError, ValueError):
+                pass
+            return result
+        finally:
+            try:
+                current = store.load(run_id)
+                if current.watcher_pid == own_pid:
+                    store.update(run_id, watcher_pid=None, watcher_status="stopped")
+            except (KeyError, ValueError):
+                pass
+
+    def resume(self, run_id: str) -> PublishResult:
+        """Reattach to a timed-out verification window and continue monitoring."""
+        store = RunStore(self.profile_dir)
+        try:
+            record = store.load(run_id)
+        except (KeyError, ValueError) as exc:
+            return PublishResult(PublishStatus.FAILED, "browser", str(exc), error_code="run_not_found", run_id=run_id)
+        if record.status in {PublishStatus.PUBLISHED.value, PublishStatus.DRAFT_CREATED.value, "cancelled"}:
+            return self._result_from_record(record) or PublishResult(
+                PublishStatus.FAILED,
+                "browser",
+                f"run 已结束: {record.status}",
+                error_code="run_already_finished",
+                run_id=run_id,
+            )
         if not record.debug_port:
             return PublishResult(
                 PublishStatus.FAILED,
@@ -584,55 +1001,27 @@ class BrowserPublisher:
                 error_code="session_not_available",
                 run_id=run_id,
             )
-        sync_playwright = self._import_playwright()
-        with sync_playwright() as playwright:
-            try:
-                browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{record.debug_port}")
-                context = browser.contexts[0] if browser.contexts else browser.new_context()
-                page = context.pages[-1] if context.pages else context.new_page()
-                output_dir = self.profile_dir / "artifacts"
-                if self._has_visible_text(page, "继续发表"):
-                    if not self._click_continue_publish(page):
-                        result = PublishResult(
-                            PublishStatus.FAILED,
-                            "browser",
-                            "恢复时无法点击继续发表",
-                            error_code="continue_publish_stuck",
-                            run_id=run_id,
-                        )
-                        store.save_result(run_id, result)
-                        return result
-                page, qrcode_path = self._wait_for_publish_qrcode(context, page, output_dir)
-                if not qrcode_path:
-                    body = page.locator("body").inner_text(timeout=1000)
-                    if not re.search(r"微信验证|扫码验证|二维码验证|请使用微信扫码|发布成功|发表成功", body):
-                        result = PublishResult(
-                            PublishStatus.FAILED,
-                            "browser",
-                            "恢复时没有找到微信验证页面",
-                            qrcode_path=record.qrcode_path,
-                            error_code="session_ui_missing",
-                            run_id=run_id,
-                        )
-                        store.save_result(run_id, result)
-                        return result
-                    qrcode_path = record.qrcode_path
-                store.update(run_id, status=PublishStatus.AWAITING_SCAN.value, qrcode_path=qrcode_path, message="等待微信发布验证")
-                result = self._wait_for_final_result(page, qrcode_path)
-                result = replace(result, run_id=run_id)
-                store.save_result(run_id, result)
-                if result.status not in {PublishStatus.AWAITING_SCAN, PublishStatus.UNKNOWN, PublishStatus.VERIFICATION_EXPIRED}:
-                    browser.close()
-                return result
-            except Exception as exc:
-                result = PublishResult(PublishStatus.FAILED, "browser", f"恢复浏览器会话失败: {exc}", error_code="resume_error", run_id=run_id)
-                store.save_result(run_id, result)
-                return result
+        if record.watcher_pid and self._process_alive(record.watcher_pid) and record.watcher_pid != os.getpid():
+            return self._result_from_record(record) or self._scan_result(
+                "后台 watcher 正在监测扫码状态",
+                stage=record.stage or "publish_verification",
+                qrcode_path=record.qrcode_path,
+                run_id=run_id,
+                generation=record.generation or 1,
+                expires_at=record.expires_at,
+            )
+        store.update(run_id, watcher_pid=os.getpid(), watcher_status="running", monitor_until=time.time() + self.scan_timeout)
+        return self.watch(run_id)
 
     def cancel(self, run_id: str) -> dict[str, Any]:
         """Close a profile-owned Chrome session and mark the run cancelled."""
         store = RunStore(self.profile_dir)
         record = store.load(run_id)
+        if record.watcher_pid and record.watcher_pid != os.getpid() and self._process_alive(record.watcher_pid):
+            try:
+                os.kill(record.watcher_pid, 15)
+            except OSError:
+                pass
         if record.debug_port:
             sync_playwright = self._import_playwright()
             with sync_playwright() as playwright:
@@ -641,7 +1030,13 @@ class BrowserPublisher:
                     browser.close()
                 except Exception:
                     pass
-        return store.update(run_id, status="cancelled", message="已取消浏览器发布会话").to_dict()
+        return store.update(
+            run_id,
+            status="cancelled",
+            watcher_pid=None,
+            watcher_status="stopped",
+            message="已取消浏览器发布会话",
+        ).to_dict()
 
     def publish(self, article: Article, *, confirm_publish: bool = False, run_id: Optional[str] = None) -> PublishResult:
         if not confirm_publish and article.publish:
@@ -666,7 +1061,12 @@ class BrowserPublisher:
         def finish(result: PublishResult) -> PublishResult:
             nonlocal last_result
             if run_id:
+                record = store.load(run_id)
+                metadata = dict(result.metadata)
+                if record.article_title:
+                    metadata.setdefault("article_title", record.article_title)
                 result = replace(result, run_id=run_id)
+                result = replace(result, metadata=metadata)
                 store.save_result(run_id, result)
             last_result = result
             return result
@@ -687,9 +1087,14 @@ class BrowserPublisher:
                 browser = None
             page = context.pages[0] if context.pages else context.new_page()
             try:
-                login_result = self._ensure_login(page, output_dir)
+                if run_id:
+                    store.save_article(run_id, article)
+                login_result = self._ensure_login(page, output_dir, run_id=run_id)
                 if login_result:
-                    return finish(login_result)
+                    result = finish(login_result)
+                    if run_id and result.status is PublishStatus.AWAITING_SCAN:
+                        self._start_watcher(run_id)
+                    return result
                 page.goto(self.base_url, wait_until="domcontentloaded")
                 try:
                     page = self._open_article_editor(context, page)
@@ -708,11 +1113,26 @@ class BrowserPublisher:
                 ) and not (
                     final_visible.count() == 1 and final_visible.is_visible(timeout=500)
                 ):
-                    # The first click can only save the new article. Once the
-                    # save toast disappears, click the editor publish button
-                    # again to open the group-notification confirmation.
-                    page.locator(".mass_send").click()
-                clicked_confirmation = self._click_publish_confirmation(page)
+                    modal_already_open = any(
+                        self._has_visible_text(page, text)
+                        for text in ("群发通知", "今天还有", "今天没有通知次数", "定时发表")
+                    )
+                    if modal_already_open:
+                        clicked_confirmation = self._click_publish_confirmation(page)
+                    else:
+                        clicked_confirmation = False
+                    if clicked_confirmation:
+                        page.wait_for_timeout(1000)
+                        # The modal was already open, so skip the second click
+                        # below and continue with the continuation action.
+                        pass
+                    else:
+                        # The first click can only save the new article. Once the
+                        # save toast disappears, click the editor publish button
+                        # again to open the group-notification confirmation.
+                        page.locator(".mass_send").click()
+                else:
+                    clicked_confirmation = self._click_publish_confirmation(page)
                 if not clicked_confirmation:
                     continue_button = page.get_by_role("button", name="继续发表", exact=True)
                     if continue_button.count() == 1 and continue_button.is_visible(timeout=500):
@@ -747,7 +1167,14 @@ class BrowserPublisher:
                         qrcode_path=str(screenshot) if screenshot else None,
                         error_code="continue_publish_stuck",
                     ))
-                page, qrcode_path = self._wait_for_publish_qrcode(context, page, output_dir)
+                generation = 1
+                page, qrcode_path = self._wait_for_publish_qrcode(
+                    context,
+                    page,
+                    output_dir,
+                    run_id=run_id,
+                    generation=generation,
+                )
                 if not qrcode_path:
                     screenshot = output_dir / "wechat_publish_verification_not_reached.png"
                     try:
@@ -761,9 +1188,23 @@ class BrowserPublisher:
                         qrcode_path=str(screenshot) if screenshot else None,
                         error_code="publish_verification_not_reached",
                     ))
+                body = page.locator("body").inner_text(timeout=1000)
+                stage = self._scan_stage(body)
+                expires_at = time.time() + self.qr_ttl
                 if run_id:
-                    store.update(run_id, status=PublishStatus.AWAITING_SCAN.value, qrcode_path=qrcode_path, message="请在当前 Chrome 验证窗口扫码")
-                return finish(self._wait_for_final_result(page, qrcode_path))
+                    result = self._scan_result(
+                        "请使用微信扫码验证发布",
+                        stage=stage,
+                        qrcode_path=qrcode_path,
+                        run_id=run_id,
+                        generation=generation,
+                        expires_at=expires_at,
+                        error_code="publish_scan_pending",
+                    )
+                    result = finish(result)
+                    self._start_watcher(run_id)
+                    return result
+                return finish(self._wait_for_final_result(page, qrcode_path, generation=generation, expires_at=expires_at))
             except Exception as exc:
                 screenshot = output_dir / "wechat_publish_error.png"
                 try:

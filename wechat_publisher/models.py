@@ -112,6 +112,17 @@ class Article:
     def asset_map(self) -> Dict[str, Path]:
         return {asset.alias: asset.path for asset in self.assets}
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "title": self.title,
+            "body": self.body,
+            "body_format": self.body_format,
+            "digest": self.digest,
+            "cover_image": str(self.cover_image) if self.cover_image else None,
+            "assets": [{"alias": asset.alias, "path": str(asset.path)} for asset in self.assets],
+            "publish": self.publish,
+        }
+
 
 @dataclass(frozen=True)
 class PublishResult:
@@ -124,6 +135,10 @@ class PublishResult:
     article_id: Optional[str] = None
     error_code: Optional[str] = None
     run_id: Optional[str] = None
+    stage: Optional[str] = None
+    expires_at: Optional[float] = None
+    generation: int = 0
+    next_action: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -141,6 +156,10 @@ class PublishResult:
             "article_id": self.article_id,
             "error_code": self.error_code,
             "run_id": self.run_id,
+            "stage": self.stage,
+            "expires_at": self.expires_at,
+            "generation": self.generation,
+            "next_action": self.next_action,
             "metadata": self.metadata,
         }
 

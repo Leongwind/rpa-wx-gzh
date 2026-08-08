@@ -1,4 +1,4 @@
 interface:
   display_name: "WeChat MP Publisher"
   short_description: "Create drafts or publish WeChat Official Account articles"
-  default_prompt: "Publish the supplied WeChat Official Account article JSON, using the official API when configured and otherwise the persistent Playwright browser session. Surface QR-code scans and report only verified results."
+  default_prompt: "Publish the supplied WeChat Official Account article JSON, using the official API when configured and otherwise the isolated Playwright browser session. Show any login or publish-verification QR as an in-conversation card, monitor the scan automatically, and report only verified results."

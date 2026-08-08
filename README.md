@@ -118,4 +118,6 @@ python -m wechat_publisher publish \
 
 文章 JSON 使用 `title`、`body`、`body_format`、`cover_image` 和 `assets` 字段。正文图片使用 `{{asset:alias}}` 引用。浏览器会话默认保存在 `playwright_data/`，凭证通过环境变量提供，不要提交到仓库。
 
+浏览器发布进入登录或微信验证时，Skill 会把本次二维码作为对话内图片卡片展示，并在后台 watcher 中自动监测扫码状态。二维码文件按 `run_id` 和代数生成，过期时最多只刷新当前验证一次，不会重新提交文章。默认监测 5 分钟，可通过 `WX_SCAN_TIMEOUT` 调整；`WX_QR_TTL` 控制卡片倒计时，`WX_QR_REFRESH_LIMIT` 控制自动刷新次数。会话仍可使用 `status`、`resume`、`cancel` 管理。
+
 如果系统已经安装 Chrome，可设置 `WX_PLAYWRIGHT_EXECUTABLE_PATH` 指向浏览器程序，跳过 Playwright 浏览器下载。

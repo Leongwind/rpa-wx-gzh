@@ -29,12 +29,21 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = subparsers.add_parser("cancel", help="关闭并取消发布会话")
     cancel.add_argument("--run-id", required=True)
     cancel.add_argument("--json", action="store_true")
+    watcher = subparsers.add_parser("_watch", help=argparse.SUPPRESS)
+    watcher.add_argument("--run-id", required=True)
+    subparsers._choices_actions = [
+        action for action in subparsers._choices_actions if action.dest != "_watch"
+    ]
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     publisher = AutoPublisher.from_environment()
+    if args.command == "_watch":
+        result = publisher.watch(args.run_id)
+        print(json.dumps(result.to_dict(), ensure_ascii=False))
+        return 0 if result.status in {PublishStatus.PUBLISHED, PublishStatus.DRAFT_CREATED} else 1
     if args.command == "status":
         try:
             payload = publisher.status(args.run_id)

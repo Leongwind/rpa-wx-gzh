@@ -12,7 +12,7 @@ Use the repository publisher rather than editing the legacy Selenium flow.
 1. Validate the article JSON before opening a browser or calling an external API.
 2. Use `python -m wechat_publisher publish --input <file> --mode auto --confirm-publish` for a real publication. The command returns a `run_id`; keep it for status, resume, or cancel. Omit `--confirm-publish` for validation or draft-only work.
 3. Keep `WX_APPID` and `WX_APPSECRET` in the environment only. Never put them in article JSON, logs, skill files, or chat output.
-4. If the result is `awaiting_scan`, direct the user to scan the verification QR in the visible, profile-owned Chrome window. `qrcode_path` is a fresh diagnostic screenshot fallback, not a replacement for the live browser page. Do not claim success until the publisher returns `published`.
+4. If the result is `awaiting_scan`, render `qrcode_path` as an in-conversation image using its absolute path. Show a compact card with the article title, `stage`, `next_action`, and the `expires_at` countdown. Tell the user to scan the displayed QR; the isolated Chrome window is a fallback and diagnostics surface. Do not ask the user to find a file or run `resume` manually.
 5. If the result is `unknown`, do not retry through another provider: the API may already have accepted the publication.
 
 ## Article input
@@ -35,8 +35,8 @@ Supported `body_format` values are `markdown` and `html`. All referenced asset a
 
 - `published`: report the publication as successful.
 - `draft_created`: report the draft ID and state that it was not publicly published.
-- `awaiting_scan`: surface the QR path and keep the session available for a later retry.
-- `verification_expired`: ask the user to rerun so a fresh QR code can be generated.
+- `awaiting_scan`: show the current QR card and stage. A background watcher automatically checks the existing browser session for scan success; the session remains resumable through `run_id`.
+- `verification_expired`: explain that the current verification challenge expired after the allowed refresh; keep the `run_id` and do not resubmit the article automatically.
 - `failed`: report the error code and message.
 - `unknown`: stop and ask the user to verify the publication in the Official Account console before retrying.
 
@@ -50,4 +50,6 @@ python -m wechat_publisher resume --run-id <run_id> --json
 python -m wechat_publisher cancel --run-id <run_id> --json
 ```
 
-`resume` reattaches to the existing profile-owned Chrome window. `cancel` closes that window and marks the run cancelled. Never reuse an old QR image from a previous run; if the live verification UI is not present, the publisher returns a failure instead of exposing a stale QR.
+`resume` reattaches to the existing profile-owned Chrome window. `cancel` closes that window and marks the run cancelled. The publisher refreshes only the current verification challenge once after expiry; it never clicks “发表” again or resubmits the article. Never reuse an old QR image from a previous run; every QR uses the run ID and generation in its filename.
+
+The scan stages are `login`, `publish_verification`, and `admin_approval`. Treat `admin_approval` as waiting for the administrator, not as a failure. Only an explicit `published` result is a successful publication.

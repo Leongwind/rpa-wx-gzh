@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from wechat_publisher.models import PublishResult, PublishStatus
+from wechat_publisher.models import Article, PublishResult, PublishStatus
 from wechat_publisher.session import RunStore
 
 
@@ -23,3 +23,18 @@ def test_run_store_round_trips_result_without_secrets(tmp_path: Path):
     assert saved.status == PublishStatus.AWAITING_SCAN.value
     assert loaded.to_dict()["result"]["run_id"] == "wx-test-1"
     assert "appsecret" not in store.path("wx-test-1").read_text(encoding="utf-8")
+
+
+def test_run_store_persists_article_snapshot(tmp_path: Path):
+    cover = tmp_path / "cover.png"
+    cover.write_bytes(b"png")
+    article = Article.from_dict({"title": "卡片测试", "body": "正文", "cover_image": str(cover)})
+    store = RunStore(tmp_path / "profile")
+    store.create("wx-article-1")
+
+    path = store.save_article("wx-article-1", article)
+    restored = store.load_article("wx-article-1")
+
+    assert Path(path).is_file()
+    assert restored.title == article.title
+    assert restored.cover_image == article.cover_image

@@ -29,7 +29,9 @@ class AutoPublisher:
             profile,
             base_url=os.getenv("WX_MP_URL", BrowserPublisher.BASE_URL),
             headless=os.getenv("WX_HEADLESS", "0").lower() in {"1", "true", "yes"},
-            scan_timeout=float(os.getenv("WX_SCAN_TIMEOUT", "120")),
+            scan_timeout=float(os.getenv("WX_SCAN_TIMEOUT", "300")),
+            qr_ttl=float(os.getenv("WX_QR_TTL", "120")),
+            qr_refresh_limit=int(os.getenv("WX_QR_REFRESH_LIMIT", "1")),
             executable_path=os.getenv("WX_PLAYWRIGHT_EXECUTABLE_PATH") or None,
         )
         return cls(api=api, browser=browser)
@@ -72,6 +74,11 @@ class AutoPublisher:
         if self.browser is None:
             return PublishResult(PublishStatus.FAILED, "none", "没有可用的浏览器发布器", error_code="browser_unavailable", run_id=run_id)
         return self.browser.resume(run_id)
+
+    def watch(self, run_id: str) -> PublishResult:
+        if self.browser is None:
+            return PublishResult(PublishStatus.FAILED, "none", "没有可用的浏览器发布器", error_code="browser_unavailable", run_id=run_id)
+        return self.browser.watch(run_id)
 
     def status(self, run_id: str) -> dict:
         if self.browser is None:

@@ -23,8 +23,17 @@ class RunRecord:
     provider: str = "browser"
     profile_dir: str = ""
     artifact_dir: str = ""
+    article_path: Optional[str] = None
+    article_title: Optional[str] = None
     debug_port: Optional[int] = None
     qrcode_path: Optional[str] = None
+    stage: Optional[str] = None
+    expires_at: Optional[float] = None
+    generation: int = 0
+    next_action: Optional[str] = None
+    watcher_pid: Optional[int] = None
+    watcher_status: str = "not_started"
+    monitor_until: Optional[float] = None
     message: str = ""
     error_code: Optional[str] = None
     result: Dict[str, Any] = field(default_factory=dict)
@@ -38,8 +47,17 @@ class RunRecord:
             "provider": self.provider,
             "profile_dir": self.profile_dir,
             "artifact_dir": self.artifact_dir,
+            "article_path": self.article_path,
+            "article_title": self.article_title,
             "debug_port": self.debug_port,
             "qrcode_path": self.qrcode_path,
+            "stage": self.stage,
+            "expires_at": self.expires_at,
+            "generation": self.generation,
+            "next_action": self.next_action,
+            "watcher_pid": self.watcher_pid,
+            "watcher_status": self.watcher_status,
+            "monitor_until": self.monitor_until,
             "message": self.message,
             "error_code": self.error_code,
             "result": self.result,
@@ -120,10 +138,42 @@ class RunStore:
             status=payload["status"],
             provider=payload["provider"],
             qrcode_path=payload.get("qrcode_path"),
+            stage=payload.get("stage"),
+            expires_at=payload.get("expires_at"),
+            generation=payload.get("generation", 0),
+            next_action=payload.get("next_action"),
             message=payload.get("message", ""),
             error_code=payload.get("error_code"),
             result=payload,
         )
+
+    def save_article(self, run_id: str, article: Any) -> str:
+        record = self.load(run_id)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / f"{record.run_id}.article.json"
+        fd, temp_name = tempfile.mkstemp(prefix=f".{record.run_id}.article.", suffix=".tmp", dir=self.directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(article.to_dict(), handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        finally:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+        self.update(run_id, article_path=str(path), article_title=article.title)
+        return str(path)
+
+    def load_article(self, run_id: str) -> Any:
+        from .models import Article
+
+        record = self.load(run_id)
+        if not record.article_path:
+            raise ValueError(f"run 没有可恢复的文章快照: {run_id}")
+        return Article.from_dict(json.loads(Path(record.article_path).read_text(encoding="utf-8")))
 
     def active_records(self) -> list[RunRecord]:
         if not self.directory.is_dir():
