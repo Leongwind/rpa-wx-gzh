@@ -180,6 +180,25 @@ class BrowserPublisher:
                 continue
         return False
 
+    def _open_article_editor(self, context: Any, page: Any) -> Any:
+        """Open the new-creation article card and return its editor page."""
+        menu = page.locator("div.new-creation__menu-item").filter(has_text="文章")
+        count = menu.count()
+        if count != 1:
+            raise RuntimeError(f"文章入口不唯一或不存在: {count}")
+        menu.click()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            pages = context.pages
+            for candidate in reversed(pages):
+                try:
+                    if candidate.locator("textarea#title, input[placeholder*='标题']").count() == 1:
+                        return candidate
+                except Exception:
+                    continue
+            page.wait_for_timeout(500)
+        return page
+
     def _wait_for_final_result(self, page: Any, qrcode_path: Optional[str]) -> PublishResult:
         deadline = time.monotonic() + self.scan_timeout
         observed_dialog = False
@@ -250,8 +269,10 @@ class BrowserPublisher:
                 if login_result:
                     return login_result
                 page.goto(self.base_url, wait_until="domcontentloaded")
-                if not self._click_text(page, "文章"):
-                    return PublishResult(PublishStatus.FAILED, "browser", "未找到文章入口", error_code="article_menu_missing")
+                try:
+                    page = self._open_article_editor(context, page)
+                except Exception as exc:
+                    return PublishResult(PublishStatus.FAILED, "browser", f"未能打开文章入口: {exc}", error_code="article_menu_missing")
                 page.wait_for_load_state("domcontentloaded", timeout=15000)
                 self._fill_article(page, article)
                 if not article.publish:
