@@ -321,7 +321,10 @@ class BrowserPublisher:
         while time.monotonic() < deadline:
             if self._logged_in(page):
                 return None
-            body_text = page.locator("body").inner_text(timeout=1000)
+            body_text = self._body_text(page)
+            if not body_text:
+                time.sleep(self.poll_interval)
+                continue
             try:
                 frame_text = page.frame_locator("iframe#login_wx_iframe").locator("body").inner_text(timeout=500)
                 body_text = f"{body_text}\n{frame_text}"
@@ -455,23 +458,74 @@ class BrowserPublisher:
         if select_from_body.count() != 1:
             raise RuntimeError("未找到从正文选择封面入口")
         select_from_body.evaluate("node => node.click()")
-        image_item = page.locator("li.appmsg_content_img_item").first
-        image_item.wait_for(state="visible", timeout=10000)
-        image_item.click()
-        next_button = page.get_by_role("button", name="下一步", exact=True)
-        next_button.click()
-        page.get_by_role("button", name="确认", exact=True).click()
+        self._select_body_cover_in_dialog(page)
         preview = cover_area.locator(".js_cover_preview_new").first
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             try:
                 style = preview.get_attribute("style") or ""
-                if preview.is_visible(timeout=500) and "background-image: url(\"\")" not in style:
+                has_image = bool(re.search(r"background-image\s*:\s*url\((?![\"']?\s*[\"']?\))", style))
+                if preview.is_visible(timeout=500) and has_image:
                     return
             except Exception:
                 pass
             time.sleep(0.5)
         raise RuntimeError("封面上传后未出现预览")
+
+    def _select_body_cover_in_dialog(self, page: Any) -> None:
+        """Select the image itself and advance through the cover dialogs.
+
+        WeChat renders the selectable click target inside the list item. A
+        click on ``li.appmsg_content_img_item`` does not select the image and
+        leaves the next action visually disabled.
+        """
+        items = page.locator("li.appmsg_content_img_item")
+        selected_item = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and selected_item is None:
+            for index in range(items.count() - 1, -1, -1):
+                candidate = items.nth(index)
+                try:
+                    if candidate.is_visible(timeout=200):
+                        selected_item = candidate
+                        break
+                except Exception:
+                    continue
+            if selected_item is None:
+                page.wait_for_timeout(200)
+        if selected_item is None:
+            raise RuntimeError("从正文选择封面时未找到可用图片")
+
+        image_target = selected_item.locator(".appmsg_content_img.cover").first
+        if image_target.count() == 0:
+            image_target = selected_item
+        # Keep this step idempotent so a recovery/resume does not toggle an
+        # already selected cover back to the unselected state.
+        if "selected" not in (selected_item.get_attribute("class") or "").split():
+            image_target.click(force=True)
+
+        if not self._click_enabled_dialog_button(page, "下一步", timeout=5):
+            raise RuntimeError("封面图片未被选中，“下一步”仍不可用")
+        if not self._click_enabled_dialog_button(page, "确认", timeout=10):
+            raise RuntimeError("封面裁剪弹窗未出现可用的“确认”按钮")
+
+    @staticmethod
+    def _click_enabled_dialog_button(page: Any, name: str, *, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            buttons = page.get_by_role("button", name=name, exact=True)
+            for index in range(buttons.count() - 1, -1, -1):
+                button = buttons.nth(index)
+                try:
+                    class_name = button.get_attribute("class") or ""
+                    disabled = button.get_attribute("disabled") is not None or "disabled" in class_name
+                    if button.is_visible(timeout=200) and button.is_enabled() and not disabled:
+                        button.click(force=True)
+                        return True
+                except Exception:
+                    continue
+            page.wait_for_timeout(200)
+        return False
 
     @staticmethod
     def _file_payload(path: Path) -> dict[str, Any] | str:
@@ -507,6 +561,8 @@ class BrowserPublisher:
                 if not dialog.is_visible(timeout=200):
                     continue
             except Exception:
+                continue
+            if not self._disable_group_notification(dialog):
                 continue
             buttons_in_dialog = dialog.get_by_role("button", name="发表", exact=True)
             for button_index in range(buttons_in_dialog.count() - 1, -1, -1):
@@ -574,6 +630,28 @@ class BrowserPublisher:
                 continue
         return False
 
+    @staticmethod
+    def _disable_group_notification(dialog: Any) -> bool:
+        """Force the one-per-day group notification switch off before publish."""
+        setting = dialog.locator(".mass_send__notify").first
+        try:
+            if setting.count() == 0:
+                return True
+            switch = setting.locator("input.weui-desktop-switch__input").first
+            if switch.count() == 0 or not switch.is_checked():
+                return True
+            # The native input is visually hidden. A DOM click still runs the
+            # Vue change handler and avoids Playwright viewport failures.
+            switch.evaluate("node => node.click()")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if not switch.is_checked():
+                    return True
+                time.sleep(0.1)
+            return False
+        except Exception:
+            return False
+
     def _click_publish_confirmation(self, page: Any) -> bool:
         """Wait for and click the final publish modal's green action."""
         deadline = time.monotonic() + 15
@@ -615,6 +693,37 @@ class BrowserPublisher:
             try:
                 if locator.nth(index).is_visible(timeout=200):
                     return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _body_text(page: Any, *, timeout: int = 1000) -> str:
+        """Read page text without failing a run during a transient navigation."""
+        try:
+            return page.locator("body").inner_text(timeout=timeout)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _published_article_after(page: Any, title: str, after: float) -> bool:
+        """Confirm that the recent-publish list contains this run's article."""
+        titles = page.locator("a.weui-desktop-mass-appmsg__title")
+        for index in range(titles.count()):
+            candidate = titles.nth(index)
+            try:
+                if candidate.inner_text(timeout=200).strip() != title:
+                    continue
+                card = candidate.locator(
+                    "xpath=ancestor::div[contains(concat(' ', normalize-space(@class), ' '), "
+                    "' weui-desktop-mass-appmsg ')][1]"
+                )
+                links = card.locator("a[href*='send_time=']")
+                for link_index in range(links.count()):
+                    href = links.nth(link_index).get_attribute("href") or ""
+                    match = re.search(r"(?:[?&])send_time=(\d+)", href)
+                    if match and float(match.group(1)) >= after:
+                        return True
             except Exception:
                 continue
         return False
@@ -713,8 +822,20 @@ class BrowserPublisher:
         current_stage = "publish_verification"
         refresh_count = max(0, generation - 1)
         last_recorded_stage: Optional[str] = None
+        article_title: Optional[str] = None
+        run_started_at = 0.0
+        if store and run_id:
+            try:
+                record = store.load(run_id)
+                article_title = record.article_title
+                run_started_at = record.created_at
+            except (KeyError, ValueError):
+                pass
         while time.monotonic() < deadline:
-            body = page.locator("body").inner_text(timeout=1000)
+            body = self._body_text(page)
+            if not body:
+                time.sleep(self.poll_interval)
+                continue
             current_stage = self._scan_stage(body)
             if store and run_id and current_stage != last_recorded_stage:
                 store.update(
@@ -777,6 +898,16 @@ class BrowserPublisher:
                     PublishStatus.PUBLISHED,
                     "browser",
                     "文章发布成功",
+                    qrcode_path=qrcode_path,
+                    run_id=run_id,
+                    stage=current_stage,
+                    generation=generation,
+                )
+            if article_title and self._published_article_after(page, article_title, run_started_at):
+                return PublishResult(
+                    PublishStatus.PUBLISHED,
+                    "browser",
+                    "文章已出现在公众号近期发表记录中",
                     qrcode_path=qrcode_path,
                     run_id=run_id,
                     stage=current_stage,
@@ -912,7 +1043,10 @@ class BrowserPublisher:
                             article = store.load_article(run_id)
                             store.update(run_id, watcher_pid=None, watcher_status="not_started")
                             return self.publish(article, confirm_publish=article.publish, run_id=run_id)
-                        body = page.locator("body").inner_text(timeout=1000)
+                        body = self._body_text(page)
+                        if not body:
+                            time.sleep(self.poll_interval)
+                            continue
                         if "二维码已过期" in body or "已过期" in body:
                             result = PublishResult(
                                 PublishStatus.VERIFICATION_EXPIRED,
@@ -1208,7 +1342,7 @@ class BrowserPublisher:
                         qrcode_path=str(screenshot) if screenshot else None,
                         error_code="publish_verification_not_reached",
                     ))
-                body = page.locator("body").inner_text(timeout=1000)
+                body = self._body_text(page)
                 stage = self._scan_stage(body)
                 expires_at = time.time() + self.qr_ttl
                 if run_id:
