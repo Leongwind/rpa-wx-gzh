@@ -299,8 +299,44 @@ class BrowserPublisher:
                 continue
         return False
 
-    def _click_publish_confirmation(self, page: Any) -> bool:
+    def _click_publish_confirmation_once(self, page: Any) -> bool:
         """Click the green publish action in the final publish modal."""
+        continue_publish = page.get_by_text("继续发表", exact=True)
+        try:
+            if continue_publish.count() > 0 and continue_publish.last.is_visible(timeout=500):
+                continue_publish.last.click()
+                return True
+        except Exception:
+            pass
+        matching_buttons = []
+        buttons = page.locator("button")
+        for index in range(buttons.count() - 1, -1, -1):
+            button = buttons.nth(index)
+            try:
+                if button.is_visible(timeout=200) and button.inner_text(timeout=200).strip() == "发表":
+                    matching_buttons.append(button)
+            except Exception:
+                continue
+        if len(matching_buttons) >= 2:
+            try:
+                matching_buttons[0].click()
+                return True
+            except Exception:
+                pass
+        primary_publish = page.locator("button.weui-desktop-btn_primary").filter(has_text="发表").last
+        try:
+            if primary_publish.count() == 1 and primary_publish.is_visible(timeout=500):
+                primary_publish.click()
+                return True
+        except Exception:
+            pass
+        exact_publish = page.get_by_text("发表", exact=True)
+        try:
+            if exact_publish.count() > 1 and exact_publish.last.is_visible(timeout=500):
+                exact_publish.last.click()
+                return True
+        except Exception:
+            pass
         for selector in (".weui-desktop-dialog", ".weui-desktop-dialog__wrp", ".dialog_wrp", "[role='dialog']"):
             dialog = page.locator(selector).filter(has_text=re.compile("群发通知|分组通知|定时发表|发表"))
             try:
@@ -318,6 +354,15 @@ class BrowserPublisher:
                         return True
                 except Exception:
                     continue
+        return False
+
+    def _click_publish_confirmation(self, page: Any) -> bool:
+        """Wait for and click the final publish modal's green action."""
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if self._click_publish_confirmation_once(page):
+                return True
+            page.wait_for_timeout(300)
         return False
 
     def _open_article_editor(self, context: Any, page: Any) -> Any:
@@ -420,12 +465,26 @@ class BrowserPublisher:
                 if not self._click_text(page, "发表"):
                     return PublishResult(PublishStatus.FAILED, "browser", "未找到发表按钮", error_code="publish_button_missing")
                 page.wait_for_timeout(800)
-                if not self._click_publish_confirmation(page):
+                clicked_confirmation = self._click_publish_confirmation(page)
+                if not clicked_confirmation:
                     continue_button = page.get_by_role("button", name="继续发表", exact=True)
                     if continue_button.count() == 1 and continue_button.is_visible(timeout=500):
                         continue_button.click()
-                    else:
-                        self._click_publish_confirmation(page)
+                        clicked_confirmation = True
+                if not clicked_confirmation:
+                    screenshot = output_dir / "wechat_publish_confirmation_missing.png"
+                    try:
+                        page.screenshot(path=str(screenshot), full_page=True)
+                    except Exception:
+                        screenshot = None
+                    return PublishResult(
+                        PublishStatus.FAILED,
+                        "browser",
+                        "未确认点击发表弹窗，已阻止生成无效验证二维码",
+                        qrcode_path=str(screenshot) if screenshot else None,
+                        error_code="publish_confirmation_missing",
+                    )
+                page.wait_for_timeout(1000)
                 qrcode_path = None
                 for candidate in reversed(context.pages):
                     qrcode_path = self._capture_publish_qrcode(candidate, output_dir)
