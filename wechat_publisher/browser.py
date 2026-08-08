@@ -383,6 +383,20 @@ class BrowserPublisher:
             page.wait_for_timeout(300)
         return False
 
+    def _click_continue_publish(self, page: Any) -> bool:
+        """Wait for and click the group-notification continuation action."""
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            continue_publish = page.get_by_text("继续发表", exact=True)
+            try:
+                if continue_publish.count() > 0 and continue_publish.last.is_visible(timeout=500):
+                    continue_publish.last.evaluate("node => node.click()")
+                    return True
+            except Exception:
+                pass
+            page.wait_for_timeout(300)
+        return False
+
     def _open_article_editor(self, context: Any, page: Any) -> Any:
         """Open the new-creation article card and return its editor page."""
         menu = page.locator("div.new-creation__menu-item").filter(has_text="文章")
@@ -482,7 +496,18 @@ class BrowserPublisher:
                     return PublishResult(PublishStatus.DRAFT_CREATED, "browser", "文章已填写，未执行发布")
                 if not self._click_text(page, "发表"):
                     return PublishResult(PublishStatus.FAILED, "browser", "未找到发表按钮", error_code="publish_button_missing")
-                page.wait_for_timeout(800)
+                page.wait_for_timeout(2500)
+                continue_visible = page.get_by_text("继续发表", exact=True)
+                final_visible = page.locator("button.weui-desktop-btn_primary").filter(has_text="发表").last
+                if not (
+                    continue_visible.count() > 0 and continue_visible.last.is_visible(timeout=500)
+                ) and not (
+                    final_visible.count() == 1 and final_visible.is_visible(timeout=500)
+                ):
+                    # The first click can only save the new article. Once the
+                    # save toast disappears, click the editor publish button
+                    # again to open the group-notification confirmation.
+                    page.locator(".mass_send").click()
                 clicked_confirmation = self._click_publish_confirmation(page)
                 if not clicked_confirmation:
                     continue_button = page.get_by_role("button", name="继续发表", exact=True)
@@ -502,6 +527,8 @@ class BrowserPublisher:
                         qrcode_path=str(screenshot) if screenshot else None,
                         error_code="publish_confirmation_missing",
                     )
+                page.wait_for_timeout(1000)
+                self._click_continue_publish(page)
                 page.wait_for_timeout(1000)
                 remaining_continue = page.get_by_text("继续发表", exact=True)
                 if remaining_continue.count() > 0 and remaining_continue.last.is_visible(timeout=500):
