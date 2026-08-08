@@ -500,6 +500,24 @@ class BrowserPublisher:
 
     def _click_publish_confirmation_once(self, page: Any) -> bool:
         """Click the green publish action in the final publish modal."""
+        dialogs = page.locator(".weui-desktop-dialog, .weui-desktop-dialog__wrp, .dialog_wrp, [role='dialog']")
+        for index in range(dialogs.count() - 1, -1, -1):
+            dialog = dialogs.nth(index)
+            try:
+                if not dialog.is_visible(timeout=200):
+                    continue
+            except Exception:
+                continue
+            buttons_in_dialog = dialog.get_by_role("button", name="发表", exact=True)
+            for button_index in range(buttons_in_dialog.count() - 1, -1, -1):
+                button = buttons_in_dialog.nth(button_index)
+                try:
+                    if button.is_visible(timeout=200):
+                        button.click(force=True)
+                        return True
+                except Exception:
+                    continue
+
         buttons = page.locator("button")
         for index in range(buttons.count() - 1, -1, -1):
             button = buttons.nth(index)
@@ -533,8 +551,8 @@ class BrowserPublisher:
                 pass
         primary_publish = page.locator("button.weui-desktop-btn_primary").filter(has_text="发表").last
         try:
-            if primary_publish.count() == 1 and primary_publish.is_visible(timeout=500):
-                primary_publish.click()
+            if primary_publish.is_visible(timeout=500):
+                primary_publish.click(force=True)
                 return True
         except Exception:
             pass
@@ -545,23 +563,15 @@ class BrowserPublisher:
                 return True
         except Exception:
             pass
-        for selector in (".weui-desktop-dialog", ".weui-desktop-dialog__wrp", ".dialog_wrp", "[role='dialog']"):
-            dialog = page.locator(selector).filter(has_text=re.compile("群发通知|分组通知|定时发表|发表"))
+        exact_publish = page.get_by_text("发表", exact=True)
+        for index in range(exact_publish.count() - 1, -1, -1):
+            locator = exact_publish.nth(index)
             try:
-                if not dialog.first.is_visible(timeout=500):
-                    continue
+                if locator.is_visible(timeout=200):
+                    locator.click(force=True)
+                    return True
             except Exception:
                 continue
-            for locator in (
-                dialog.first.get_by_role("button", name="发表", exact=True),
-                dialog.first.get_by_text("发表", exact=True),
-            ):
-                try:
-                    if locator.count() == 1 and locator.is_visible(timeout=500):
-                        locator.click()
-                        return True
-                except Exception:
-                    continue
         return False
 
     def _click_publish_confirmation(self, page: Any) -> bool:
@@ -929,25 +939,37 @@ class BrowserPublisher:
                             error_code="login_scan_timeout",
                         )
                 else:
-                    result_page, qrcode_path = self._wait_for_publish_qrcode(
-                        context,
-                        page,
-                        output_dir,
-                        run_id=run_id,
-                        generation=record.generation or 1,
-                    )
-                    page = result_page
-                    qrcode_path = qrcode_path or record.qrcode_path
-                    result = self._wait_for_final_result(
-                        page,
-                        qrcode_path,
-                        context=context,
-                        store=store,
-                        run_id=run_id,
-                        generation=record.generation or 1,
-                        expires_at=record.expires_at,
-                        output_dir=output_dir,
-                    )
+                    if self._has_visible_text(page, "继续发表"):
+                        if not self._click_continue_publish(page):
+                            result = PublishResult(
+                                PublishStatus.FAILED,
+                                "browser",
+                                "继续发表弹窗未能确认，未生成验证二维码",
+                                error_code="continue_publish_stuck",
+                                run_id=run_id,
+                            )
+                        else:
+                            page.wait_for_timeout(1000)
+                    if result is None:
+                        result_page, qrcode_path = self._wait_for_publish_qrcode(
+                            context,
+                            page,
+                            output_dir,
+                            run_id=run_id,
+                            generation=record.generation or 1,
+                        )
+                        page = result_page
+                        qrcode_path = qrcode_path or record.qrcode_path
+                        result = self._wait_for_final_result(
+                            page,
+                            qrcode_path,
+                            context=context,
+                            store=store,
+                            run_id=run_id,
+                            generation=record.generation or 1,
+                            expires_at=record.expires_at,
+                            output_dir=output_dir,
+                        )
                 result = replace(result, run_id=run_id)
                 store.save_result(run_id, result)
                 if result.status is PublishStatus.PUBLISHED:
@@ -1110,9 +1132,7 @@ class BrowserPublisher:
                 final_visible = page.locator("button.weui-desktop-btn_primary").filter(has_text="发表").last
                 if not (
                     self._has_visible_text(page, "继续发表")
-                ) and not (
-                    final_visible.count() == 1 and final_visible.is_visible(timeout=500)
-                ):
+                ) and not final_visible.is_visible(timeout=500):
                     modal_already_open = any(
                         self._has_visible_text(page, text)
                         for text in ("群发通知", "今天还有", "今天没有通知次数", "定时发表")
