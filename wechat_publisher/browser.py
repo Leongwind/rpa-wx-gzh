@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
+from mimetypes import guess_type
 from typing import Any, Iterable, Optional
 
 from .content import render_browser_html
@@ -33,7 +34,15 @@ class BrowserPublisher:
         "a.account_info",
         "span.avatar img",
     )
-    SUCCESS_TEXT = re.compile(r"发布成功|发表成功|保存成功")
+    SUCCESS_TEXT = re.compile(r"(?<!原创)(?:发布|发表)成功")
+    PUBLISH_QR_SELECTORS = (
+        ".dialog_wrp img[class*='qrcode']",
+        "[role='dialog'] img[class*='qrcode']",
+        "img[class*='qrcode']",
+        "img[src*='qrcode']",
+        ".dialog_wrp canvas",
+        "[role='dialog'] canvas",
+    )
 
     def __init__(
         self,
@@ -95,6 +104,55 @@ class BrowserPublisher:
             except Exception:
                 continue
         return None
+
+    def _capture_publish_qrcode(self, page: Any, output_dir: Path) -> Optional[str]:
+        """Capture a publish verification QR, including canvas-based dialogs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        dialog = page.locator(".dialog_wrp, [role='dialog'], .weui-desktop-dialog").filter(has_text=re.compile("微信验证|扫码|二维码|发表|发布"))
+        try:
+            if dialog.first.is_visible(timeout=500):
+                path = output_dir / "wechat_publish_qrcode.png"
+                dialog.first.screenshot(path=str(path), animations="disabled")
+                self._enlarge_qrcode(path)
+                return str(path)
+        except Exception:
+            pass
+        for selector in self.PUBLISH_QR_SELECTORS:
+            locator = page.locator(selector).first
+            try:
+                if locator.is_visible(timeout=500):
+                    path = output_dir / "wechat_publish_qrcode.png"
+                    locator.screenshot(path=str(path))
+                    self._enlarge_qrcode(path)
+                    return str(path)
+            except Exception:
+                continue
+        for selector in (".dialog_wrp iframe", "[role='dialog'] iframe", ".weui-desktop-dialog iframe"):
+            frame = page.locator(selector).first
+            try:
+                if frame.is_visible(timeout=500):
+                    path = output_dir / "wechat_publish_qrcode.png"
+                    frame.screenshot(path=str(path))
+                    self._enlarge_qrcode(path)
+                    return str(path)
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _enlarge_qrcode(path: Path) -> None:
+        """Make a small browser-rendered QR easier for phone cameras to read."""
+        try:
+            from PIL import Image
+
+            image = Image.open(path)
+            width, height = image.size
+            if max(width, height) < 400:
+                image.resize((width * 4, height * 4), Image.Resampling.NEAREST).save(path)
+        except Exception:
+            # QR capture should not fail solely because optional image tooling
+            # is unavailable; the original screenshot remains usable.
+            return
 
     def _wait_for_login(self, page: Any, qrcode_path: Optional[str]) -> PublishResult | None:
         deadline = time.monotonic() + self.scan_timeout
@@ -162,13 +220,70 @@ class BrowserPublisher:
         )
 
         if article.cover_image:
-            file_input = page.locator("input[type='file']").first
+            self._fill_cover_from_body(page, article)
+
+    def _fill_cover_from_body(self, page: Any, article: Article) -> None:
+        """Upload the cover into the body, then select it as the cover.
+
+        Current editor builds expose no direct local-file input in the cover
+        menu. They do expose local upload from the image toolbar and then
+        offer the uploaded body image through ``从正文选择``.
+        """
+        editor = page.locator("div.mock-iframe .ProseMirror[contenteditable='true']")
+        before_images = page.locator("div.mock-iframe img.rich_pages").count()
+        editor.click()
+        page.get_by_text("图片", exact=True).first.click()
+        image_input = page.locator("input[type='file']").first
+        image_input.set_input_files(self._file_payload(article.cover_image))
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if page.locator("div.mock-iframe img.rich_pages").count() > before_images:
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("正文图片上传后未出现图片")
+
+        cover_area = page.locator("#js_cover_area")
+        if cover_area.count() != 1:
+            raise RuntimeError("未找到封面区域")
+        cover_label = cover_area.get_by_text("拖拽或选择封面", exact=True)
+        if cover_label.count() == 1 and cover_label.is_visible(timeout=1000):
+            cover_label.click()
+        else:
+            cover_area.locator(".select-cover__btn, .js_cover_btn_area:visible").first.click()
+        page.wait_for_timeout(300)
+        select_from_body = page.locator("a.js_selectCoverFromContent:visible").first
+        if select_from_body.count() != 1:
+            raise RuntimeError("未找到从正文选择封面入口")
+        select_from_body.evaluate("node => node.click()")
+        image_item = page.locator("li.appmsg_content_img_item").first
+        image_item.wait_for(state="visible", timeout=10000)
+        image_item.click()
+        next_button = page.get_by_role("button", name="下一步", exact=True)
+        next_button.click()
+        page.get_by_role("button", name="确认", exact=True).click()
+        preview = cover_area.locator(".js_cover_preview_new").first
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
             try:
-                file_input.set_input_files(str(article.cover_image))
+                style = preview.get_attribute("style") or ""
+                if preview.is_visible(timeout=500) and "background-image: url(\"\")" not in style:
+                    return
             except Exception:
-                # Some versions only expose the picker after clicking cover;
-                # publish flow will surface a precise failure if no cover was set.
                 pass
+            time.sleep(0.5)
+        raise RuntimeError("封面上传后未出现预览")
+
+    @staticmethod
+    def _file_payload(path: Path) -> dict[str, Any] | str:
+        """Return a Playwright upload payload with a trustworthy MIME type."""
+        raw = path.read_bytes()
+        if raw.startswith(b"\xff\xd8\xff"):
+            return {"name": f"{path.stem}.jpg", "mimeType": "image/jpeg", "buffer": raw}
+        if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            return {"name": f"{path.stem}.png", "mimeType": "image/png", "buffer": raw}
+        mime = guess_type(path.name)[0] or "application/octet-stream"
+        return {"name": path.name, "mimeType": mime, "buffer": raw}
 
     def _click_text(self, page: Any, text: str) -> bool:
         candidates = [
@@ -182,6 +297,27 @@ class BrowserPublisher:
                     return True
             except Exception:
                 continue
+        return False
+
+    def _click_publish_confirmation(self, page: Any) -> bool:
+        """Click the green publish action in the final publish modal."""
+        for selector in (".weui-desktop-dialog", ".weui-desktop-dialog__wrp", ".dialog_wrp", "[role='dialog']"):
+            dialog = page.locator(selector).filter(has_text=re.compile("群发通知|分组通知|定时发表|发表"))
+            try:
+                if not dialog.first.is_visible(timeout=500):
+                    continue
+            except Exception:
+                continue
+            for locator in (
+                dialog.first.get_by_role("button", name="发表", exact=True),
+                dialog.first.get_by_text("发表", exact=True),
+            ):
+                try:
+                    if locator.count() == 1 and locator.is_visible(timeout=500):
+                        locator.click()
+                        return True
+                except Exception:
+                    continue
         return False
 
     def _open_article_editor(self, context: Any, page: Any) -> Any:
@@ -217,7 +353,7 @@ class BrowserPublisher:
                     qrcode_path=qrcode_path,
                     error_code="publish_qrcode_expired",
                 )
-            if self.SUCCESS_TEXT.search(body):
+            if any(self.SUCCESS_TEXT.search(line.strip()) for line in body.splitlines()):
                 return PublishResult(PublishStatus.PUBLISHED, "browser", "文章发布成功", qrcode_path=qrcode_path)
             dialog = page.locator(".dialog_wrp, [role='dialog']").filter(has_text=re.compile("微信验证|发表|发布"))
             try:
@@ -283,9 +419,19 @@ class BrowserPublisher:
                     return PublishResult(PublishStatus.DRAFT_CREATED, "browser", "文章已填写，未执行发布")
                 if not self._click_text(page, "发表"):
                     return PublishResult(PublishStatus.FAILED, "browser", "未找到发表按钮", error_code="publish_button_missing")
-                self._click_text(page, "发表")
-                self._click_text(page, "继续发表")
-                qrcode_path = self._capture_qrcode(page, output_dir, "wechat_publish_qrcode.png")
+                page.wait_for_timeout(800)
+                if not self._click_publish_confirmation(page):
+                    continue_button = page.get_by_role("button", name="继续发表", exact=True)
+                    if continue_button.count() == 1 and continue_button.is_visible(timeout=500):
+                        continue_button.click()
+                    else:
+                        self._click_publish_confirmation(page)
+                qrcode_path = None
+                for candidate in reversed(context.pages):
+                    qrcode_path = self._capture_publish_qrcode(candidate, output_dir)
+                    if qrcode_path:
+                        page = candidate
+                        break
                 return self._wait_for_final_result(page, qrcode_path)
             except Exception as exc:
                 screenshot = output_dir / "wechat_publish_error.png"
