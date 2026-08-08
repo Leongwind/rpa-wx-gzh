@@ -10,9 +10,9 @@ Use the repository publisher rather than editing the legacy Selenium flow.
 ## Workflow
 
 1. Validate the article JSON before opening a browser or calling an external API.
-2. Use `python -m wechat_publisher publish --input <file> --mode auto --confirm-publish` for a real publication. Omit `--confirm-publish` for validation or draft-only work.
+2. Use `python -m wechat_publisher publish --input <file> --mode auto --confirm-publish` for a real publication. The command returns a `run_id`; keep it for status, resume, or cancel. Omit `--confirm-publish` for validation or draft-only work.
 3. Keep `WX_APPID` and `WX_APPSECRET` in the environment only. Never put them in article JSON, logs, skill files, or chat output.
-4. If the result is `awaiting_scan`, show the returned `qrcode_path` and ask the user to scan it with WeChat. Do not claim success until the publisher returns `published`.
+4. If the result is `awaiting_scan`, direct the user to scan the verification QR in the visible, profile-owned Chrome window. `qrcode_path` is a fresh diagnostic screenshot fallback, not a replacement for the live browser page. Do not claim success until the publisher returns `published`.
 5. If the result is `unknown`, do not retry through another provider: the API may already have accepted the publication.
 
 ## Article input
@@ -39,3 +39,15 @@ Supported `body_format` values are `markdown` and `html`. All referenced asset a
 - `verification_expired`: ask the user to rerun so a fresh QR code can be generated.
 - `failed`: report the error code and message.
 - `unknown`: stop and ask the user to verify the publication in the Official Account console before retrying.
+
+## Recovering a verification session
+
+The browser publisher uses the isolated `WX_PLAYWRIGHT_PROFILE` directory and a local run registry under `playwright_data/sessions/`. It does not reuse the user's normal Chrome profile. If the initial command times out while the verification window is still open:
+
+```bash
+python -m wechat_publisher status --run-id <run_id> --json
+python -m wechat_publisher resume --run-id <run_id> --json
+python -m wechat_publisher cancel --run-id <run_id> --json
+```
+
+`resume` reattaches to the existing profile-owned Chrome window. `cancel` closes that window and marks the run cancelled. Never reuse an old QR image from a previous run; if the live verification UI is not present, the publisher returns a failure instead of exposing a stale QR.

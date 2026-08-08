@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import re
+import shutil
+import socket
+import subprocess
 import time
+from dataclasses import replace
 from pathlib import Path
 from mimetypes import guess_type
 from typing import Any, Iterable, Optional
 
 from .content import render_browser_html
 from .models import Article, PublishResult, PublishStatus
+from .session import RunStore
 
 
 class PlaywrightUnavailable(RuntimeError):
@@ -69,6 +74,80 @@ class BrowserPublisher:
         except ImportError as exc:  # pragma: no cover
             raise PlaywrightUnavailable("请安装 playwright，并运行 playwright install chromium") from exc
         return sync_playwright
+
+    @staticmethod
+    def _free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def _chrome_executable(self) -> Optional[str]:
+        if self.executable_path:
+            return self.executable_path
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            shutil.which("google-chrome"),
+            shutil.which("chromium"),
+            shutil.which("chromium-browser"),
+        ]
+        return next((path for path in candidates if path), None)
+
+    def _connect_cdp_context(self, playwright: Any, run_id: str, store: RunStore) -> tuple[Any, Any]:
+        """Connect to a profile-owned Chrome so later commands can reattach."""
+        browser_type = playwright.chromium
+        record = store.load(run_id)
+        candidate_ports = [record.debug_port] if record.debug_port else [item.debug_port for item in store.active_records()]
+        for candidate_port in candidate_ports:
+            if not candidate_port:
+                continue
+            try:
+                browser = browser_type.connect_over_cdp(f"http://127.0.0.1:{candidate_port}")
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                if record.debug_port != candidate_port:
+                    store.update(run_id, debug_port=candidate_port)
+                return browser, context
+            except Exception:
+                pass
+
+        executable = self._chrome_executable()
+        if not executable:
+            raise PlaywrightUnavailable("未找到 Chrome/Edge，请设置 WX_PLAYWRIGHT_EXECUTABLE_PATH")
+        port = self._free_port()
+        args = [
+            executable,
+            f"--user-data-dir={self.profile_dir}",
+            f"--remote-debugging-port={port}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--window-size=1440,1000",
+            self.base_url,
+        ]
+        if self.headless:
+            args.insert(-1, "--headless=new")
+        process = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        store.update(run_id, debug_port=port)
+        deadline = time.monotonic() + 15
+        last_error: Optional[Exception] = None
+        while time.monotonic() < deadline:
+            try:
+                browser = browser_type.connect_over_cdp(f"http://127.0.0.1:{port}")
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                return browser, context
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.25)
+        try:
+            process.terminate()
+        except Exception:
+            pass
+        raise RuntimeError(f"无法连接到持久化 Chrome 调试会话: {last_error}")
 
     @staticmethod
     def _visible(page: Any, selectors: Iterable[str]) -> Optional[Any]:
@@ -387,15 +466,48 @@ class BrowserPublisher:
         """Wait for and click the group-notification continuation action."""
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
+            buttons = page.locator("button")
+            for index in range(buttons.count() - 1, -1, -1):
+                button = buttons.nth(index)
+                try:
+                    if button.inner_text(timeout=200).strip() == "继续发表" and button.is_visible(timeout=200):
+                        button.click(force=True)
+                        return True
+                except Exception:
+                    continue
             continue_publish = page.get_by_text("继续发表", exact=True)
-            try:
-                if continue_publish.count() > 0 and continue_publish.last.is_visible(timeout=500):
-                    continue_publish.last.evaluate("node => node.click()")
-                    return True
-            except Exception:
-                pass
+            for index in range(continue_publish.count() - 1, -1, -1):
+                candidate = continue_publish.nth(index)
+                try:
+                    if candidate.is_visible(timeout=200):
+                        candidate.evaluate("node => node.click()")
+                        return True
+                except Exception:
+                    continue
             page.wait_for_timeout(300)
         return False
+
+    @staticmethod
+    def _has_visible_text(page: Any, text: str) -> bool:
+        locator = page.get_by_text(text, exact=True)
+        for index in range(locator.count()):
+            try:
+                if locator.nth(index).is_visible(timeout=200):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _wait_for_publish_qrcode(self, context: Any, page: Any, output_dir: Path) -> tuple[Any, Optional[str]]:
+        """Wait until the post-confirmation verification UI actually exists."""
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            for candidate in reversed(context.pages):
+                qrcode_path = self._capture_publish_qrcode(candidate, output_dir)
+                if qrcode_path:
+                    return candidate, qrcode_path
+            page.wait_for_timeout(300)
+        return page, None
 
     def _open_article_editor(self, context: Any, page: Any) -> Any:
         """Open the new-creation article card and return its editor page."""
@@ -457,7 +569,81 @@ class BrowserPublisher:
             error_code="publish_scan_timeout",
         )
 
-    def publish(self, article: Article, *, confirm_publish: bool = False) -> PublishResult:
+    def resume(self, run_id: str) -> PublishResult:
+        """Reattach to a timed-out verification window and continue polling."""
+        store = RunStore(self.profile_dir)
+        try:
+            record = store.load(run_id)
+        except (KeyError, ValueError) as exc:
+            return PublishResult(PublishStatus.FAILED, "browser", str(exc), error_code="run_not_found", run_id=run_id)
+        if not record.debug_port:
+            return PublishResult(
+                PublishStatus.FAILED,
+                "browser",
+                "run 没有可恢复的浏览器调试会话，请重新执行 publish",
+                error_code="session_not_available",
+                run_id=run_id,
+            )
+        sync_playwright = self._import_playwright()
+        with sync_playwright() as playwright:
+            try:
+                browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{record.debug_port}")
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = context.pages[-1] if context.pages else context.new_page()
+                output_dir = self.profile_dir / "artifacts"
+                if self._has_visible_text(page, "继续发表"):
+                    if not self._click_continue_publish(page):
+                        result = PublishResult(
+                            PublishStatus.FAILED,
+                            "browser",
+                            "恢复时无法点击继续发表",
+                            error_code="continue_publish_stuck",
+                            run_id=run_id,
+                        )
+                        store.save_result(run_id, result)
+                        return result
+                page, qrcode_path = self._wait_for_publish_qrcode(context, page, output_dir)
+                if not qrcode_path:
+                    body = page.locator("body").inner_text(timeout=1000)
+                    if not re.search(r"微信验证|扫码验证|二维码验证|请使用微信扫码|发布成功|发表成功", body):
+                        result = PublishResult(
+                            PublishStatus.FAILED,
+                            "browser",
+                            "恢复时没有找到微信验证页面",
+                            qrcode_path=record.qrcode_path,
+                            error_code="session_ui_missing",
+                            run_id=run_id,
+                        )
+                        store.save_result(run_id, result)
+                        return result
+                    qrcode_path = record.qrcode_path
+                store.update(run_id, status=PublishStatus.AWAITING_SCAN.value, qrcode_path=qrcode_path, message="等待微信发布验证")
+                result = self._wait_for_final_result(page, qrcode_path)
+                result = replace(result, run_id=run_id)
+                store.save_result(run_id, result)
+                if result.status not in {PublishStatus.AWAITING_SCAN, PublishStatus.UNKNOWN, PublishStatus.VERIFICATION_EXPIRED}:
+                    browser.close()
+                return result
+            except Exception as exc:
+                result = PublishResult(PublishStatus.FAILED, "browser", f"恢复浏览器会话失败: {exc}", error_code="resume_error", run_id=run_id)
+                store.save_result(run_id, result)
+                return result
+
+    def cancel(self, run_id: str) -> dict[str, Any]:
+        """Close a profile-owned Chrome session and mark the run cancelled."""
+        store = RunStore(self.profile_dir)
+        record = store.load(run_id)
+        if record.debug_port:
+            sync_playwright = self._import_playwright()
+            with sync_playwright() as playwright:
+                try:
+                    browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{record.debug_port}")
+                    browser.close()
+                except Exception:
+                    pass
+        return store.update(run_id, status="cancelled", message="已取消浏览器发布会话").to_dict()
+
+    def publish(self, article: Article, *, confirm_publish: bool = False, run_id: Optional[str] = None) -> PublishResult:
         if not confirm_publish and article.publish:
             return PublishResult(
                 PublishStatus.FAILED,
@@ -468,39 +654,57 @@ class BrowserPublisher:
         sync_playwright = self._import_playwright()
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         output_dir = self.profile_dir / "artifacts"
+        store = RunStore(self.profile_dir)
+        if run_id:
+            try:
+                store.load(run_id)
+            except KeyError:
+                store.create(run_id)
+            store.update(run_id, status="running", provider="browser")
+        last_result: Optional[PublishResult] = None
+
+        def finish(result: PublishResult) -> PublishResult:
+            nonlocal last_result
+            if run_id:
+                result = replace(result, run_id=run_id)
+                store.save_result(run_id, result)
+            last_result = result
+            return result
+
         with sync_playwright() as playwright:
             browser_launcher = getattr(playwright, self.browser_type, playwright.chromium)
-            launch_options = {
-                "user_data_dir": str(self.profile_dir),
-                "headless": self.headless,
-                "viewport": {"width": 1440, "height": 1000},
-            }
-            if self.executable_path:
-                launch_options["executable_path"] = self.executable_path
-            context = browser_launcher.launch_persistent_context(
-                **launch_options,
-            )
+            if run_id:
+                browser, context = self._connect_cdp_context(playwright, run_id, store)
+            else:
+                launch_options = {
+                    "user_data_dir": str(self.profile_dir),
+                    "headless": self.headless,
+                    "viewport": {"width": 1440, "height": 1000},
+                }
+                if self.executable_path:
+                    launch_options["executable_path"] = self.executable_path
+                context = browser_launcher.launch_persistent_context(**launch_options)
+                browser = None
             page = context.pages[0] if context.pages else context.new_page()
             try:
                 login_result = self._ensure_login(page, output_dir)
                 if login_result:
-                    return login_result
+                    return finish(login_result)
                 page.goto(self.base_url, wait_until="domcontentloaded")
                 try:
                     page = self._open_article_editor(context, page)
                 except Exception as exc:
-                    return PublishResult(PublishStatus.FAILED, "browser", f"未能打开文章入口: {exc}", error_code="article_menu_missing")
+                    return finish(PublishResult(PublishStatus.FAILED, "browser", f"未能打开文章入口: {exc}", error_code="article_menu_missing"))
                 page.wait_for_load_state("domcontentloaded", timeout=15000)
                 self._fill_article(page, article)
                 if not article.publish:
-                    return PublishResult(PublishStatus.DRAFT_CREATED, "browser", "文章已填写，未执行发布")
+                    return finish(PublishResult(PublishStatus.DRAFT_CREATED, "browser", "文章已填写，未执行发布"))
                 if not self._click_text(page, "发表"):
-                    return PublishResult(PublishStatus.FAILED, "browser", "未找到发表按钮", error_code="publish_button_missing")
+                    return finish(PublishResult(PublishStatus.FAILED, "browser", "未找到发表按钮", error_code="publish_button_missing"))
                 page.wait_for_timeout(2500)
-                continue_visible = page.get_by_text("继续发表", exact=True)
                 final_visible = page.locator("button.weui-desktop-btn_primary").filter(has_text="发表").last
                 if not (
-                    continue_visible.count() > 0 and continue_visible.last.is_visible(timeout=500)
+                    self._has_visible_text(page, "继续发表")
                 ) and not (
                     final_visible.count() == 1 and final_visible.is_visible(timeout=500)
                 ):
@@ -520,49 +724,69 @@ class BrowserPublisher:
                         page.screenshot(path=str(screenshot), full_page=True)
                     except Exception:
                         screenshot = None
-                    return PublishResult(
+                    return finish(PublishResult(
                         PublishStatus.FAILED,
                         "browser",
                         "未确认点击发表弹窗，已阻止生成无效验证二维码",
                         qrcode_path=str(screenshot) if screenshot else None,
                         error_code="publish_confirmation_missing",
-                    )
+                    ))
                 page.wait_for_timeout(1000)
-                self._click_continue_publish(page)
+                clicked_continue = self._click_continue_publish(page)
                 page.wait_for_timeout(1000)
-                remaining_continue = page.get_by_text("继续发表", exact=True)
-                if remaining_continue.count() > 0 and remaining_continue.last.is_visible(timeout=500):
+                if not clicked_continue or self._has_visible_text(page, "继续发表"):
                     screenshot = output_dir / "wechat_publish_confirmation_stuck.png"
                     try:
                         page.screenshot(path=str(screenshot), full_page=True)
                     except Exception:
                         screenshot = None
-                    return PublishResult(
+                    return finish(PublishResult(
                         PublishStatus.FAILED,
                         "browser",
                         "继续发表弹窗未关闭，已阻止捕获二维码",
                         qrcode_path=str(screenshot) if screenshot else None,
                         error_code="continue_publish_stuck",
-                    )
-                qrcode_path = None
-                for candidate in reversed(context.pages):
-                    qrcode_path = self._capture_publish_qrcode(candidate, output_dir)
-                    if qrcode_path:
-                        page = candidate
-                        break
-                return self._wait_for_final_result(page, qrcode_path)
+                    ))
+                page, qrcode_path = self._wait_for_publish_qrcode(context, page, output_dir)
+                if not qrcode_path:
+                    screenshot = output_dir / "wechat_publish_verification_not_reached.png"
+                    try:
+                        page.screenshot(path=str(screenshot), full_page=True)
+                    except Exception:
+                        screenshot = None
+                    return finish(PublishResult(
+                        PublishStatus.FAILED,
+                        "browser",
+                        "已点击继续发表，但未进入微信验证页面，已阻止继续等待",
+                        qrcode_path=str(screenshot) if screenshot else None,
+                        error_code="publish_verification_not_reached",
+                    ))
+                if run_id:
+                    store.update(run_id, status=PublishStatus.AWAITING_SCAN.value, qrcode_path=qrcode_path, message="请在当前 Chrome 验证窗口扫码")
+                return finish(self._wait_for_final_result(page, qrcode_path))
             except Exception as exc:
                 screenshot = output_dir / "wechat_publish_error.png"
                 try:
                     page.screenshot(path=str(screenshot), full_page=True)
                 except Exception:
                     screenshot = None
-                return PublishResult(
+                return finish(PublishResult(
                     PublishStatus.FAILED,
                     "browser",
                     f"浏览器发布失败: {exc}",
                     qrcode_path=str(screenshot) if screenshot else None,
                     error_code="browser_error",
-                )
+                ))
             finally:
-                context.close()
+                if run_id:
+                    if last_result and last_result.status not in {
+                        PublishStatus.AWAITING_SCAN,
+                        PublishStatus.UNKNOWN,
+                        PublishStatus.VERIFICATION_EXPIRED,
+                    }:
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+                else:
+                    context.close()

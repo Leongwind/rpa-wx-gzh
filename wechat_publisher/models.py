@@ -123,6 +123,7 @@ class PublishResult:
     publish_id: Optional[str] = None
     article_id: Optional[str] = None
     error_code: Optional[str] = None
+    run_id: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -139,6 +140,7 @@ class PublishResult:
             "publish_id": self.publish_id,
             "article_id": self.article_id,
             "error_code": self.error_code,
+            "run_id": self.run_id,
             "metadata": self.metadata,
         }
 

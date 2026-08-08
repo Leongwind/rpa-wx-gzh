@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .models import Article, PublishStatus, ValidationError
 from .publisher import AutoPublisher
+from .session import new_run_id
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -19,11 +20,49 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--mode", choices=["auto", "api", "browser", "draft"], default="auto")
     publish.add_argument("--confirm-publish", action="store_true", help="允许产生真实发布副作用")
     publish.add_argument("--json", action="store_true", help="只输出 JSON 结果")
+    resume = subparsers.add_parser("resume", help="恢复一个仍在浏览器中的发布验证会话")
+    resume.add_argument("--run-id", required=True)
+    resume.add_argument("--json", action="store_true")
+    status = subparsers.add_parser("status", help="查看发布会话状态")
+    status.add_argument("--run-id", required=True)
+    status.add_argument("--json", action="store_true")
+    cancel = subparsers.add_parser("cancel", help="关闭并取消发布会话")
+    cancel.add_argument("--run-id", required=True)
+    cancel.add_argument("--json", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    publisher = AutoPublisher.from_environment()
+    if args.command == "status":
+        try:
+            payload = publisher.status(args.run_id)
+        except (KeyError, ValueError) as exc:
+            payload = {"status": PublishStatus.FAILED.value, "error_code": "run_not_found", "message": str(exc)}
+            print(json.dumps(payload, ensure_ascii=False, indent=not args.json))
+            return 1
+        print(json.dumps(payload, ensure_ascii=False, indent=not args.json))
+        return 0
+    if args.command == "cancel":
+        try:
+            payload = publisher.cancel(args.run_id)
+        except (KeyError, ValueError) as exc:
+            payload = {"status": PublishStatus.FAILED.value, "error_code": "run_not_found", "message": str(exc)}
+            print(json.dumps(payload, ensure_ascii=False, indent=not args.json))
+            return 1
+        print(json.dumps(payload, ensure_ascii=False, indent=not args.json))
+        return 0
+    if args.command == "resume":
+        result = publisher.resume(args.run_id)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=not args.json))
+        if result.qrcode_path:
+            print(f"二维码/诊断截图: {result.qrcode_path}", file=sys.stderr)
+        if result.status in {PublishStatus.PUBLISHED, PublishStatus.DRAFT_CREATED}:
+            return 0
+        if result.status in {PublishStatus.AWAITING_SCAN, PublishStatus.VERIFICATION_EXPIRED, PublishStatus.LOGIN_REQUIRED}:
+            return 2
+        return 1
     if args.command != "publish":
         return 2
     try:
@@ -33,10 +72,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False))
         return 1
 
-    result = AutoPublisher.from_environment().publish(
+    run_id = new_run_id()
+    result = publisher.publish(
         article,
         mode=args.mode,
         confirm_publish=args.confirm_publish,
+        run_id=run_id,
     )
     if args.json:
         print(json.dumps(result.to_dict(), ensure_ascii=False))
