@@ -137,11 +137,15 @@ class BrowserPublisher:
         return self._wait_for_login(page, qrcode_path)
 
     def _fill_article(self, page: Any, article: Article) -> None:
-        title = page.locator("textarea#title, input[placeholder*='标题']").first
+        title = page.locator("div[name='title'] .ProseMirror[contenteditable='true']")
+        if title.count() != 1:
+            raise RuntimeError("未找到唯一的可见标题编辑器")
         title.wait_for(state="visible", timeout=15000)
         title.fill(article.title)
 
-        editor = page.locator("div.ProseMirror[contenteditable='true'], [contenteditable='true']").first
+        editor = page.locator("div.mock-iframe .ProseMirror[contenteditable='true']")
+        if editor.count() != 1:
+            raise RuntimeError("未找到唯一的正文编辑器")
         editor.wait_for(state="visible", timeout=15000)
         editor.click()
         # Keep the data in the DOM as a stable fallback. The live editor may
@@ -154,7 +158,7 @@ class BrowserPublisher:
               node.dispatchEvent(new Event('change', {bubbles: true}));
             }
             """,
-            {"html": render_browser_html(article)},
+            render_browser_html(article),
         )
 
         if article.cover_image:
