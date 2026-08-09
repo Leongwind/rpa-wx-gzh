@@ -30,7 +30,7 @@ class Asset:
     path: Path
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "Asset":
+    def from_dict(cls, value: Mapping[str, Any], *, base_dir: Optional[Path] = None) -> "Asset":
         if not isinstance(value, Mapping):
             raise ValidationError("每个 asset 必须是对象")
         alias = str(value.get("alias", "")).strip()
@@ -39,7 +39,10 @@ class Asset:
             raise ValidationError("asset.alias 不能为空")
         if not path_value:
             raise ValidationError(f"asset {alias!r} 缺少 path")
-        path = Path(str(path_value)).expanduser().resolve()
+        path = Path(str(path_value)).expanduser()
+        if not path.is_absolute() and base_dir is not None:
+            path = base_dir / path
+        path = path.resolve()
         if not path.is_file():
             raise ValidationError(f"asset 文件不存在: {path}")
         return cls(alias=alias, path=path)
@@ -60,7 +63,7 @@ class Article:
     publish: bool = False
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "Article":
+    def from_dict(cls, value: Mapping[str, Any], *, base_dir: Optional[Path] = None) -> "Article":
         if not isinstance(value, Mapping):
             raise ValidationError("文章输入必须是 JSON 对象")
 
@@ -79,14 +82,17 @@ class Article:
         cover_value = value.get("cover_image")
         cover_image = None
         if cover_value:
-            cover_image = Path(str(cover_value)).expanduser().resolve()
+            cover_image = Path(str(cover_value)).expanduser()
+            if not cover_image.is_absolute() and base_dir is not None:
+                cover_image = base_dir / cover_image
+            cover_image = cover_image.resolve()
             if not cover_image.is_file():
                 raise ValidationError(f"cover_image 文件不存在: {cover_image}")
 
         raw_assets = value.get("assets", []) or []
         if not isinstance(raw_assets, Iterable) or isinstance(raw_assets, (str, bytes, Mapping)):
             raise ValidationError("assets 必须是数组")
-        assets = [Asset.from_dict(item) for item in raw_assets]
+        assets = [Asset.from_dict(item, base_dir=base_dir) for item in raw_assets]
         aliases = [asset.alias for asset in assets]
         if len(aliases) != len(set(aliases)):
             raise ValidationError("assets.alias 不能重复")
@@ -107,11 +113,11 @@ class Article:
             digest=digest,
             author=str(value.get("author", "") or "").strip(),
             source_url=str(value.get("source_url", value.get("content_source_url", "")) or "").strip(),
-            need_open_comment=bool(value.get("need_open_comment", False)),
-            only_fans_can_comment=bool(value.get("only_fans_can_comment", False)),
+            need_open_comment=_strict_bool(value.get("need_open_comment", False), "need_open_comment"),
+            only_fans_can_comment=_strict_bool(value.get("only_fans_can_comment", False), "only_fans_can_comment"),
             cover_image=cover_image,
             assets=assets,
-            publish=bool(value.get("publish", False)),
+            publish=_strict_bool(value.get("publish", False), "publish"),
         )
 
     @classmethod
@@ -120,7 +126,7 @@ class Article:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValidationError(f"无法读取文章 JSON: {path}: {exc}") from exc
-        return cls.from_dict(value)
+        return cls.from_dict(value, base_dir=path.parent.resolve())
 
     def asset_map(self) -> Dict[str, Path]:
         return {asset.alias: asset.path for asset in self.assets}
@@ -171,6 +177,10 @@ class Article:
             "body": self.body,
             "body_format": self.body_format,
             "digest": self.digest,
+            "author": self.author,
+            "source_url": self.source_url,
+            "need_open_comment": self.need_open_comment,
+            "only_fans_can_comment": self.only_fans_can_comment,
             "cover_image": str(self.cover_image) if self.cover_image else None,
             "assets": [{"alias": asset.alias, "path": str(asset.path)} for asset in self.assets],
             "publish": self.publish,
@@ -219,8 +229,16 @@ class PublishResult:
 
 def _asset_references(body: str) -> set[str]:
     import re
-
+    # Fenced code is literal text, not an image instruction.
+    body = re.sub(r"(?:```|~~~).*?(?:```|~~~)", "", body, flags=re.S)
+    body = "\n".join(line for line in body.splitlines() if not re.match(r"^(?: {4}|\t)", line))
     return set(re.findall(r"\{\{asset:([A-Za-z0-9_.-]+)\}\}", body))
+
+
+def _strict_bool(value: Any, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValidationError(f"{field_name} 必须是 JSON boolean")
+    return value
 
 
 def derive_digest(body: str, *, limit: int = 120) -> str:

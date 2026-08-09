@@ -93,7 +93,7 @@ Handle results as follows:
 - `draft_created`: report the draft result and that it was not publicly sent.
 - `awaiting_scan`: show the current QR card; do not ask the user to locate a
   file or manually run `resume`.
-- `admin_approval`: keep reporting that administrator confirmation is pending.
+- `admin_approval` is a verification stage, not a top-level result status. Browser behavior is covered by local mock seams; this does not claim live WeChat verification.
 - `verification_expired`: keep the `run_id`; do not resubmit automatically.
 - `unknown`: stop and ask the user to verify the Official Account console
   before any retry.
@@ -126,3 +126,5 @@ keep its returned `run_id`, then publish that saved draft after reviewing it:
 python -m wechat_publisher publish --input article.json --mode draft --json
 python -m wechat_publisher publish --run-id <run-id> --confirm-publish --json
 ```
+BrowserPublisher 的测试替身必须显式实现并注入 `BrowserDraftAdapter`，不得通过 Page 上的 `save_draft`、`reopen_draft` 或 `upload_asset` 属性隐式探测。未注入 adapter 时使用真实 Playwright 草稿流程；回读验证要求正文图片节点数量、唯一 alias、唯一且本次上传 URL，以及与期望资源匹配的封面。
+新建文章保存前必须填写并确认 `Article.digest`；摘要控件缺失、不可见或写入值无法确认时必须 fail-closed，然后才允许 save→leave/reopen→readback。

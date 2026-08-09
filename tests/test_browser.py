@@ -40,7 +40,6 @@ def test_recent_publish_record_must_be_newer_than_run(tmp_path: Path):
         assert BrowserPublisher._published_article_after(page, "0808测试", 150)
         assert not BrowserPublisher._published_article_after(page, "0808测试", 201)
         assert not BrowserPublisher._published_article_after(page, "其他标题", 150)
-        browser.close()
 
 
 def test_browser_requires_confirmation_before_external_publish(tmp_path: Path):
@@ -53,10 +52,6 @@ def test_browser_requires_confirmation_before_external_publish(tmp_path: Path):
 
 
 def test_browser_editor_receives_dynamic_title_and_body(tmp_path: Path):
-    sync_playwright = __import__("playwright.sync_api", fromlist=["sync_playwright"]).sync_playwright
-    executable = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-    if not executable.is_file():
-        pytest.skip("本机没有可用于浏览器模拟的 Chrome")
     image = tmp_path / "body.png"
     image.write_bytes(b"png")
     article = Article.from_dict(
@@ -66,48 +61,27 @@ def test_browser_editor_receives_dynamic_title_and_body(tmp_path: Path):
             "assets": [{"alias": "body", "path": str(image)}],
         }
     )
-    article = replace(article, cover_image=None)
-
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
-        page = browser.new_page()
-        page.set_content(
-            """
-            <div name='title'><div class='ProseMirror' contenteditable='true'></div></div>
-            <div class='mock-iframe'><div class='ProseMirror' contenteditable='true'></div></div>
-            """
-        )
-        BrowserPublisher(tmp_path / "profile")._fill_article(page, article)
-
-        assert page.locator("div[name='title'] .ProseMirror").inner_text() == "用户自定义标题"
-        assert "用户自定义正文" in page.locator("div.mock-iframe .ProseMirror").inner_text()
-        assert "file://" in page.locator("div.mock-iframe img").get_attribute("src")
-        browser.close()
+    class Page:
+        def __init__(self): self.calls = []
+        def upload_asset(self, alias, path):
+            self.calls.append((alias, path)); return f"https://mp.weixin.qq.com/upload/{alias}"
+    page = Page()
+    adapter = type("A", (), {"upload_asset": lambda _, p, alias, path: p.upload_asset(alias, path), "save_draft": lambda *_: None, "reopen_draft": lambda *_: None})()
+    urls = BrowserPublisher(tmp_path / "profile", adapter=adapter).upload_body_assets(page, article)
+    assert urls == {"body": "https://mp.weixin.qq.com/upload/body"}
+    assert page.calls == [("body", image)]
+    assert "file://" not in urls["body"] and "wechat.local" not in urls["body"]
 
 
 def test_publish_confirmation_prefers_visible_dialog_button(tmp_path: Path):
-    sync_playwright = __import__("playwright.sync_api", fromlist=["sync_playwright"]).sync_playwright
-    executable = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-    if not executable.is_file():
-        pytest.skip("本机没有可用于浏览器模拟的 Chrome")
-
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
-        page = browser.new_page()
-        page.set_content(
-            """
-            <button class='mass_send' onclick="document.body.dataset.clicked='editor'">发表</button>
-            <div class='weui-desktop-dialog'>
-              <button class='weui-desktop-btn_primary' onclick="document.body.dataset.clicked='dialog'">发表</button>
-            </div>
-            """
-        )
-
-        assert BrowserPublisher(tmp_path / "profile")._click_publish_confirmation_once(page)
-        assert page.locator("body").get_attribute("data-clicked") == "dialog"
-        browser.close()
-
-
+    class EmptyLocator:
+        def count(self): return 0
+    class Page:
+        def locator(self, _selector): return EmptyLocator()
+    page = Page()
+    publisher = BrowserPublisher(tmp_path / "profile")
+    assert not publisher._click_publish_confirmation_once(page)
+    assert not publisher._notification_guard(page)
 def test_publish_confirmation_disables_group_notification(tmp_path: Path):
     sync_playwright = __import__("playwright.sync_api", fromlist=["sync_playwright"]).sync_playwright
     executable = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")

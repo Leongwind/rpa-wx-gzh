@@ -12,15 +12,23 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from mimetypes import guess_type
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Protocol
 
-from .content import render_browser_html
-from .models import Article, PublishResult, PublishStatus, derive_digest
+from .content import render_html
+from .models import Article, PublishResult, PublishStatus, derive_digest, _asset_references
 from .session import ProfileBusyError, ProfileLock, RunStore
 
 
 class PlaywrightUnavailable(RuntimeError):
     pass
+
+
+class BrowserDraftAdapter(Protocol):
+    """Explicit test/automation seam for draft and asset operations."""
+
+    def save_draft(self, page: Any) -> Optional[str]: ...
+    def reopen_draft(self, context: Any, page: Any, draft_ref: str, title: str) -> Any: ...
+    def upload_asset(self, page: Any, alias: str, path: Path) -> str: ...
 
 
 class BrowserPublisher:
@@ -63,6 +71,7 @@ class BrowserPublisher:
         qr_refresh_limit: int = 1,
         browser_type: str = "chromium",
         executable_path: Optional[str] = None,
+        adapter: Optional[BrowserDraftAdapter] = None,
     ) -> None:
         self.profile_dir = Path(profile_dir).expanduser().resolve()
         self.base_url = base_url
@@ -73,6 +82,9 @@ class BrowserPublisher:
         self.qr_refresh_limit = max(0, int(qr_refresh_limit))
         self.browser_type = browser_type
         self.executable_path = executable_path
+        self.adapter = adapter
+        self._last_uploaded_urls: dict[str, str] = {}
+        self._last_cover_url: Optional[str] = None
 
     def _import_playwright(self) -> Any:
         try:
@@ -165,6 +177,12 @@ class BrowserPublisher:
             except Exception:
                 continue
         return None
+
+    def _restore_resource_refs(self, refs: dict[str, Any]) -> None:
+        body = refs.get("body", {}) if isinstance(refs, dict) else {}
+        self._last_uploaded_urls = dict(body) if isinstance(body, dict) else {}
+        cover = refs.get("cover") if isinstance(refs, dict) else None
+        self._last_cover_url = cover if isinstance(cover, str) else None
 
     def _logged_in(self, page: Any) -> bool:
         return self._visible(page, self.LOGGED_IN_SELECTORS) is not None
@@ -396,7 +414,7 @@ class BrowserPublisher:
             expires_at=expires_at,
         )
 
-    def _fill_article(self, page: Any, article: Article) -> None:
+    def _fill_article(self, page: Any, article: Article) -> Optional[str]:
         title = page.locator("div[name='title'] .ProseMirror[contenteditable='true']")
         if title.count() != 1:
             raise RuntimeError("未找到唯一的可见标题编辑器")
@@ -410,6 +428,7 @@ class BrowserPublisher:
         editor.click()
         # Keep the data in the DOM as a stable fallback. The live editor may
         # rewrite this structure, so we also dispatch input/change events.
+        image_urls = self.upload_body_assets(page, article)
         editor.evaluate(
             """
             (node, html) => {
@@ -418,11 +437,105 @@ class BrowserPublisher:
               node.dispatchEvent(new Event('change', {bubbles: true}));
             }
             """,
-            render_browser_html(article),
+            render_html(article, image_urls),
         )
-
+        digest = page.locator("[data-article-digest], input[placeholder*='摘要'], textarea[placeholder*='摘要']")
+        if digest.count() != 1:
+            raise RuntimeError("未找到唯一的摘要控件")
+        digest = digest.first
+        if not digest.is_visible(timeout=500):
+            raise RuntimeError("摘要控件不可见")
+        digest.fill(article.digest)
+        if digest.input_value(timeout=500) != article.digest:
+            raise RuntimeError("摘要写入结果无法确认")
         if article.cover_image:
             self._fill_cover_from_body(page, article)
+        if not article.publish:
+            draft_ref = self._save_draft_and_wait(page)
+            if not draft_ref:
+                raise RuntimeError("未观察到草稿保存完成信号")
+            return str(draft_ref)
+        return None
+
+    def _save_draft_and_wait(self, page: Any) -> Optional[str]:
+        if self.adapter is not None:
+            result = self.adapter.save_draft(page)
+            return str(result) if result else None
+        buttons = page.get_by_text("保存", exact=True)
+        if buttons.count() == 0:
+            buttons = page.get_by_text("存为草稿", exact=True)
+        if buttons.count() == 0:
+            return None
+        try:
+            buttons.last.click()
+            for text in ("保存成功", "草稿已保存", "已保存"):
+                if self._has_visible_text(page, text):
+                    return "observed"
+        except Exception:
+            return None
+        return None
+
+    def _reopen_and_verify_draft(self, page: Any, context: Any, draft_ref: str, article: Article) -> bool:
+        """Leave the editor and reopen the saved draft through a testable seam."""
+        if self.adapter is not None:
+            reopened = self.adapter.reopen_draft(context, page, draft_ref, article.title)
+        else:
+            try:
+                if hasattr(page, "close"):
+                    page.close()
+                listing_page = context.new_page() if hasattr(context, "new_page") else page
+                reopened = self._open_saved_draft_editor(context, listing_page, article.title)
+            except (RuntimeError, TimeoutError):
+                return False
+        if reopened is None:
+            return False
+        return self._verify_editor_content(reopened, article)
+
+    def upload_body_assets(self, page: Any, article: Article) -> dict[str, str]:
+        """Upload referenced local images through the editor seam.
+
+        The live adapter may replace this seam with the editor's file input.
+        The deterministic fallback is intentionally a hosted mock URL, never
+        a ``file://`` URL, so local fixtures exercise the same boundary.
+        """
+        referenced = _asset_references(article.body)
+        uploaded = {}
+        seen_urls = set()
+        for asset in article.assets:
+            if asset.alias not in referenced:
+                continue
+            url = None
+            # Test seam and supported editor seam: the fixture can expose a
+            # deterministic upload callback, while production uses the file
+            # input exposed by the editor.
+            if self.adapter is not None:
+                url = self.adapter.upload_asset(page, asset.alias, asset.path)
+            else:
+                inputs = page.locator("input[type='file'][accept*='image'], input[type='file']")
+                if inputs.count() == 0:
+                    raise RuntimeError(f"正文图片上传控件不存在: {asset.alias}")
+                before = {
+                    page.locator("img").nth(i).get_attribute("src")
+                    for i in range(page.locator("img").count())
+                }
+                inputs.first.set_input_files(str(asset.path))
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    images = page.locator("img")
+                    for index in range(images.count() - 1, -1, -1):
+                        candidate = images.nth(index).get_attribute("src")
+                        if candidate and candidate not in before and candidate not in seen_urls and not candidate.startswith(("file:", "https://wechat.local")):
+                            url = candidate; break
+                    if url: break
+                    page.wait_for_timeout(100)
+            if not isinstance(url, str) or not url.startswith(("https://", "http://")) or "wechat.local" in url or url.startswith("file:"):
+                raise RuntimeError(f"正文图片未获得微信托管 URL: {asset.alias}")
+            if url in seen_urls:
+                raise RuntimeError(f"正文图片 URL 映射重复: {asset.alias}")
+            seen_urls.add(url)
+            uploaded[asset.alias] = url
+        self._last_uploaded_urls = dict(uploaded)
+        return uploaded
 
     def _fill_cover_from_body(self, page: Any, article: Article) -> None:
         """Upload the cover into the body, then select it as the cover.
@@ -442,6 +555,9 @@ class BrowserPublisher:
             if page.locator("div.mock-iframe img.rich_pages").count() > before_images:
                 break
             time.sleep(0.5)
+        images = page.locator("div.mock-iframe img.rich_pages")
+        if images.count() > before_images:
+            self._last_cover_url = images.nth(images.count() - 1).get_attribute("src")
         else:
             raise RuntimeError("正文图片上传后未出现图片")
 
@@ -598,60 +714,6 @@ class BrowserPublisher:
                 except Exception:
                     continue
 
-        buttons = page.locator("button")
-        for index in range(buttons.count() - 1, -1, -1):
-            button = buttons.nth(index)
-            try:
-                if "继续发表" in button.inner_text(timeout=200) and button.is_visible(timeout=200):
-                    button.click(force=True)
-                    return True
-            except Exception:
-                continue
-        continue_publish = page.get_by_text("继续发表", exact=True)
-        try:
-            if continue_publish.count() > 0 and continue_publish.last.is_visible(timeout=500):
-                continue_publish.last.evaluate("node => node.click()")
-                return True
-        except Exception:
-            pass
-        matching_buttons = []
-        buttons = page.locator("button")
-        for index in range(buttons.count() - 1, -1, -1):
-            button = buttons.nth(index)
-            try:
-                if button.is_visible(timeout=200) and button.inner_text(timeout=200).strip() == "发表":
-                    matching_buttons.append(button)
-            except Exception:
-                continue
-        if len(matching_buttons) >= 2:
-            try:
-                matching_buttons[0].click()
-                return True
-            except Exception:
-                pass
-        primary_publish = page.locator("button.weui-desktop-btn_primary").filter(has_text="发表").last
-        try:
-            if primary_publish.is_visible(timeout=500):
-                primary_publish.click(force=True)
-                return True
-        except Exception:
-            pass
-        exact_publish = page.get_by_text("发表", exact=True)
-        try:
-            if exact_publish.count() > 1 and exact_publish.last.is_visible(timeout=500):
-                exact_publish.last.click()
-                return True
-        except Exception:
-            pass
-        exact_publish = page.get_by_text("发表", exact=True)
-        for index in range(exact_publish.count() - 1, -1, -1):
-            locator = exact_publish.nth(index)
-            try:
-                if locator.is_visible(timeout=200):
-                    locator.click(force=True)
-                    return True
-            except Exception:
-                continue
         return False
 
     @staticmethod
@@ -660,9 +722,14 @@ class BrowserPublisher:
         setting = dialog.locator(".mass_send__notify").first
         try:
             if setting.count() == 0:
-                return True
+                return False
             switch = setting.locator("input.weui-desktop-switch__input").first
-            if switch.count() == 0 or not switch.is_checked():
+            if switch.count() != 1 or not switch.is_visible(timeout=200):
+                return False
+            checked = switch.is_checked()
+            if not isinstance(checked, bool):
+                return False
+            if not checked:
                 return True
             # The native input is visually hidden. A DOM click still runs the
             # Vue change handler and avoids Playwright viewport failures.
@@ -687,6 +754,8 @@ class BrowserPublisher:
 
     def _click_continue_publish(self, page: Any) -> bool:
         """Wait for and click the group-notification continuation action."""
+        if not self._notification_guard(page):
+            return False
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             buttons = page.locator("button")
@@ -708,6 +777,17 @@ class BrowserPublisher:
                 except Exception:
                     continue
             page.wait_for_timeout(300)
+        return False
+
+    def _notification_guard(self, page: Any) -> bool:
+        dialogs = page.locator(".weui-desktop-dialog, .weui-desktop-dialog__wrp, .dialog_wrp, [role='dialog']")
+        for index in range(dialogs.count() - 1, -1, -1):
+            dialog = dialogs.nth(index)
+            try:
+                if dialog.is_visible(timeout=200) and self._disable_group_notification(dialog):
+                    return True
+            except Exception:
+                continue
         return False
 
     @staticmethod
@@ -1256,8 +1336,8 @@ class BrowserPublisher:
 
     def publish(self, article: Article, *, confirm_publish: bool = False, run_id: Optional[str] = None) -> PublishResult:
         try:
-            with ProfileLock(self.profile_dir, timeout=15.0):
-                return self._publish_unlocked(article, confirm_publish=confirm_publish, run_id=run_id)
+            with ProfileLock(self.profile_dir, timeout=15.0) as lock:
+                return self._publish_unlocked(article, confirm_publish=confirm_publish, run_id=run_id, lock=lock)
         except ProfileBusyError as exc:
             return PublishResult(
                 PublishStatus.FAILED,
@@ -1270,12 +1350,12 @@ class BrowserPublisher:
     def publish_existing(self, run_id: str, *, confirm_publish: bool = False) -> PublishResult:
         """Reopen a saved browser draft and publish it with a fresh session."""
         try:
-            with ProfileLock(self.profile_dir, timeout=15.0):
-                return self._publish_existing_unlocked(run_id, confirm_publish=confirm_publish)
+            with ProfileLock(self.profile_dir, timeout=15.0) as lock:
+                return self._publish_existing_unlocked(run_id, confirm_publish=confirm_publish, lock=lock)
         except ProfileBusyError as exc:
             return PublishResult(PublishStatus.FAILED, "browser", str(exc), error_code="profile_busy", run_id=run_id)
 
-    def _publish_existing_unlocked(self, run_id: str, *, confirm_publish: bool) -> PublishResult:
+    def _publish_existing_unlocked(self, run_id: str, *, confirm_publish: bool, lock: Optional[ProfileLock] = None) -> PublishResult:
         store = RunStore(self.profile_dir)
         try:
             record = store.load(run_id)
@@ -1290,6 +1370,7 @@ class BrowserPublisher:
                 error_code="run_not_publishable",
                 run_id=run_id,
             )
+        self._restore_resource_refs(record.resource_refs)
         if not confirm_publish:
             return PublishResult(
                 PublishStatus.FAILED,
@@ -1314,16 +1395,15 @@ class BrowserPublisher:
                         self._start_watcher(run_id)
                     return result
                 page = self._open_saved_draft_editor(context, page, article.title)
-                title_text = page.locator("div[name='title'] .ProseMirror[contenteditable='true']").inner_text(timeout=5000)
-                body_text = page.locator("div.mock-iframe .ProseMirror[contenteditable='true']").inner_text(timeout=5000)
-                if article.title not in title_text or not derive_digest(article.body, limit=60)[:20] in body_text:
+                if not self._verify_editor_content(page, article):
                     return PublishResult(
                         PublishStatus.FAILED,
                         "browser",
                         "恢复的草稿内容与运行快照不一致，已停止发布",
-                        error_code="draft_content_mismatch",
+                        error_code="content_verification_failed",
                         run_id=run_id,
                     )
+                store.transition(run_id, ("draft_created",), "submitting", lock=lock, submit_started_at=time.time())
                 result = self._submit_current_editor(context, page, output_dir, run_id=run_id)
                 result = replace(result, run_id=run_id, metadata={**result.metadata, "confirmation_summary": article.confirmation_summary()})
                 store.save_result(run_id, result)
@@ -1356,30 +1436,9 @@ class BrowserPublisher:
         run_id: Optional[str] = None,
     ) -> PublishResult:
         """Submit the currently open editor without refilling its content."""
-        if not self._click_text(page, "发表"):
-            return PublishResult(PublishStatus.FAILED, "browser", "未找到发表按钮", error_code="publish_button_missing", run_id=run_id)
-        page.wait_for_timeout(2500)
-        final_visible = page.locator("button.weui-desktop-btn_primary").filter(has_text="发表").last
-        if not self._has_visible_text(page, "继续发表") and not final_visible.is_visible(timeout=500):
-            modal_already_open = any(
-                self._has_visible_text(page, text)
-                for text in ("群发通知", "今天还有", "今天没有通知次数", "定时发表")
-            )
-            if modal_already_open:
-                clicked_confirmation = self._click_publish_confirmation(page)
-                if clicked_confirmation:
-                    page.wait_for_timeout(1000)
-            else:
-                clicked_confirmation = False
-            if not clicked_confirmation:
-                page.locator(".mass_send").click()
-        else:
-            clicked_confirmation = self._click_publish_confirmation(page)
-        if not clicked_confirmation:
-            continue_button = page.get_by_role("button", name="继续发表", exact=True)
-            if continue_button.count() == 1 and continue_button.is_visible(timeout=500):
-                continue_button.click()
-                clicked_confirmation = True
+        if not self._open_initial_publish_confirmation(page):
+            return PublishResult(PublishStatus.FAILED, "browser", "未打开发表确认弹窗", error_code="notification_state_unverified", run_id=run_id)
+        clicked_confirmation = self._guarded_final_submit(page)
         if not clicked_confirmation:
             screenshot = output_dir / "wechat_publish_confirmation_missing.png"
             try:
@@ -1391,26 +1450,10 @@ class BrowserPublisher:
                 "browser",
                 "未确认点击发表弹窗，已阻止生成无效验证二维码",
                 qrcode_path=str(screenshot) if screenshot else None,
-                error_code="publish_confirmation_missing",
+                error_code="notification_state_unverified",
                 run_id=run_id,
             )
         page.wait_for_timeout(1000)
-        clicked_continue = self._click_continue_publish(page)
-        page.wait_for_timeout(1000)
-        if not clicked_continue or self._has_visible_text(page, "继续发表"):
-            screenshot = output_dir / "wechat_publish_confirmation_stuck.png"
-            try:
-                page.screenshot(path=str(screenshot), full_page=True)
-            except Exception:
-                screenshot = None
-            return PublishResult(
-                PublishStatus.FAILED,
-                "browser",
-                "继续发表弹窗未关闭，已阻止捕获二维码",
-                qrcode_path=str(screenshot) if screenshot else None,
-                error_code="continue_publish_stuck",
-                run_id=run_id,
-            )
         generation = 1
         page, qrcode_path = self._wait_for_publish_qrcode(
             context,
@@ -1448,7 +1491,43 @@ class BrowserPublisher:
             )
         return self._wait_for_final_result(page, qrcode_path, generation=generation, expires_at=expires_at)
 
-    def _publish_unlocked(self, article: Article, *, confirm_publish: bool = False, run_id: Optional[str] = None) -> PublishResult:
+    def _open_initial_publish_confirmation(self, page: Any) -> bool:
+        dialogs = page.locator(".weui-desktop-dialog, .weui-desktop-dialog__wrp, .dialog_wrp, [role='dialog']")
+        if dialogs.count() and dialogs.last.is_visible(timeout=300):
+            return True
+        # Initial editor action is distinct from the guarded final submit.
+        try:
+            clicked = self._click_text(page, "发表")
+        except (AttributeError, TypeError):
+            return False
+        if not clicked:
+            return False
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if dialogs.count() and dialogs.last.is_visible(timeout=300):
+                return True
+            page.wait_for_timeout(100)
+        return False
+
+    def _guarded_final_submit(self, page: Any) -> bool:
+        """The sole gate for every final publish click."""
+        if not self._notification_guard(page):
+            return False
+        dialogs = page.locator(".weui-desktop-dialog, .weui-desktop-dialog__wrp, .dialog_wrp, [role='dialog']")
+        for index in range(dialogs.count() - 1, -1, -1):
+            dialog = dialogs.nth(index)
+            try:
+                buttons = dialog.get_by_role("button", name="发表", exact=True)
+                if buttons.count() and buttons.last.is_visible(timeout=300):
+                    buttons.last.click(force=True); return True
+                buttons = dialog.get_by_role("button", name="继续发表", exact=True)
+                if buttons.count() and buttons.last.is_visible(timeout=300):
+                    buttons.last.click(force=True); return True
+            except Exception:
+                continue
+        return False
+
+    def _publish_unlocked(self, article: Article, *, confirm_publish: bool = False, run_id: Optional[str] = None, lock: Optional[ProfileLock] = None) -> PublishResult:
         if not confirm_publish and article.publish:
             return PublishResult(
                 PublishStatus.FAILED,
@@ -1462,10 +1541,13 @@ class BrowserPublisher:
         store = RunStore(self.profile_dir)
         if run_id:
             try:
-                store.load(run_id)
+                existing = store.load(run_id)
             except KeyError:
                 store.create(run_id)
-            store.update(run_id, status="running", provider="browser")
+            else:
+                if existing.status in {"submitting", "unknown", "awaiting_scan", "verification_expired", "published"}:
+                    return PublishResult(PublishStatus.UNKNOWN, "browser", f"run 已处于保护状态: {existing.status}", error_code="run_protected", run_id=run_id)
+            store.update(run_id, provider="browser")
         last_result: Optional[PublishResult] = None
 
         def finish(result: PublishResult) -> PublishResult:
@@ -1511,9 +1593,17 @@ class BrowserPublisher:
                 except Exception as exc:
                     return finish(PublishResult(PublishStatus.FAILED, "browser", f"未能打开文章入口: {exc}", error_code="article_menu_missing"))
                 page.wait_for_load_state("domcontentloaded", timeout=15000)
-                self._fill_article(page, article)
+                draft_ref = self._fill_article(page, article)
+                if run_id:
+                    store.update(run_id, resource_refs={"body": dict(self._last_uploaded_urls), "cover": self._last_cover_url})
                 if not article.publish:
-                    return finish(PublishResult(PublishStatus.DRAFT_CREATED, "browser", "文章已填写，未执行发布"))
+                    if not self._reopen_and_verify_draft(page, context, draft_ref or "", article):
+                        return finish(PublishResult(PublishStatus.FAILED, "browser", "草稿保存后回读核验不一致", error_code="content_verification_failed"))
+                    return finish(PublishResult(PublishStatus.DRAFT_CREATED, "browser", "文章已保存并完成回读核验"))
+                if not self._verify_editor_content(page, article):
+                    return finish(PublishResult(PublishStatus.FAILED, "browser", "发布前内容回读核验不一致", error_code="content_verification_failed"))
+                if run_id:
+                    store.transition(run_id, ("running",), "submitting", lock=lock, submit_started_at=time.time())
                 result = self._submit_current_editor(context, page, output_dir, run_id=run_id)
                 result = finish(result)
                 if run_id and result.status is PublishStatus.AWAITING_SCAN:
@@ -1532,6 +1622,7 @@ class BrowserPublisher:
                     qrcode_path=str(screenshot) if screenshot else None,
                     error_code="browser_error",
                 ))
+
             finally:
                 if run_id:
                     if last_result and last_result.status not in {
@@ -1545,3 +1636,42 @@ class BrowserPublisher:
                             pass
                 else:
                     context.close()
+
+    def _verify_editor_content(self, page: Any, article: Article) -> bool:
+        try:
+            title = page.locator("div[name='title'] .ProseMirror, textarea#title, input[placeholder*='标题']").first.inner_text(timeout=500)
+            body = page.locator("div.mock-iframe .ProseMirror, .ProseMirror[contenteditable='true']").last.inner_text(timeout=500)
+            images = page.locator("div.mock-iframe img, .ProseMirror img")
+            digest_locator = page.locator("[data-article-digest], input[placeholder*='摘要'], textarea[placeholder*='摘要']")
+            if digest_locator.count() != 1:
+                return False
+            digest = digest_locator.first.input_value(timeout=500)
+            expected_aliases = _asset_references(article.body)
+            actual_nodes = []
+            for i in range(images.count()):
+                node = images.nth(i)
+                alias = node.get_attribute("data-asset-alias") or node.get_attribute("alt")
+                src = node.get_attribute("src") or ""
+                actual_nodes.append((alias, src))
+            aliases = [alias for alias, _ in actual_nodes]
+            urls = [src for _, src in actual_nodes]
+            expected_urls = [self._last_uploaded_urls.get(alias) for alias in expected_aliases]
+            urls_ok = (len(actual_nodes) == len(expected_aliases) and
+                       len(set(aliases)) == len(aliases) and set(aliases) == expected_aliases and
+                       all(isinstance(src, str) and src.startswith(("http://", "https://")) and
+                           "wechat.local" not in src and not src.startswith("file:") for src in urls) and
+                       all(self._last_uploaded_urls.get(alias) == src for alias, src in actual_nodes) and
+                       len(set(urls)) == len(urls) and all(expected_urls))
+            cover_ok = True
+            if article.cover_image:
+                cover = page.locator("[data-cover-url], .cover-preview img, img[data-cover]")
+                cover_value = cover.first.get_attribute("src") or cover.first.get_attribute("data-cover-url") or ""
+                expected_cover = self._last_cover_url
+                if expected_cover is None:
+                    expected_cover = next((url for alias, url in self._last_uploaded_urls.items()
+                                           if article.asset_map().get(alias) == article.cover_image), None)
+                cover_ok = cover.count() == 1 and bool(expected_cover) and cover_value == expected_cover
+            return (article.title in title and digest == article.digest and
+                    derive_digest(body) == derive_digest(article.body) and urls_ok and cover_ok)
+        except (TimeoutError, ValueError, KeyError):
+            return False

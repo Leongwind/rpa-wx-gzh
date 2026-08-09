@@ -49,7 +49,7 @@ def test_run_store_tracks_fingerprint_and_cleanup_removes_finished_run(tmp_path:
     store.save_article("wx-clean", article)
     store.save_result("wx-clean", PublishResult(PublishStatus.DRAFT_CREATED, "api", run_id="wx-clean"))
     assert store.load("wx-clean").fingerprint == article.fingerprint()
-    assert store.cleanup(older_than=0) == {"runs": 1, "files": 2}
+    assert store.cleanup(older_than=0, dry_run=False) == {"runs": 1, "files": 2}
 
 
 def test_profile_lock_prevents_concurrent_publishers(tmp_path: Path):

@@ -35,6 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup = subparsers.add_parser("cleanup", help="清理已结束且超过保留期的本地运行数据")
     cleanup.add_argument("--older-than", type=float, default=7 * 24 * 3600, help="保留秒数，默认 7 天")
     cleanup.add_argument("--json", action="store_true")
+    cleanup.add_argument("--dry-run", action="store_true", help="只报告将清理的文件（默认）")
+    cleanup.add_argument("--apply", action="store_true", help="确认执行本地清理")
+    doctor = subparsers.add_parser("doctor", help="输出无副作用环境诊断")
+    doctor.add_argument("--json", action="store_true")
     watcher = subparsers.add_parser("_watch", help=argparse.SUPPRESS)
     watcher.add_argument("--run-id", required=True)
     subparsers._choices_actions = [
@@ -71,9 +75,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "cleanup":
         from .session import RunStore
 
-        payload = RunStore(publisher.browser.profile_dir).cleanup(older_than=args.older_than)
+        payload = RunStore(publisher.browser.profile_dir).cleanup(older_than=args.older_than, dry_run=not args.apply)
         print(json.dumps(payload, ensure_ascii=False, indent=not args.json))
         return 0
+    if args.command == "doctor":
+        import importlib.util, os
+        profile = Path(os.getenv("WX_PLAYWRIGHT_PROFILE", "playwright_data"))
+        payload = {
+            "python": {"executable": sys.executable, "version": sys.version.split()[0]},
+            "packages": {"requests": importlib.util.find_spec("requests") is not None, "markdown": importlib.util.find_spec("markdown") is not None, "playwright": importlib.util.find_spec("playwright") is not None},
+            "browser_executable": bool(__import__("wechat_publisher.browser", fromlist=["BrowserPublisher"]).BrowserPublisher(profile)._chrome_executable()),
+            "profile": {"path": str(profile), "exists": profile.exists()},
+            "credentials": {"appid_present": bool(os.getenv("WX_APPID")), "appsecret_present": bool(os.getenv("WX_APPSECRET"))},
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=not args.json)); return 0
     if args.command == "resume":
         result = publisher.resume(args.run_id)
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=not args.json))

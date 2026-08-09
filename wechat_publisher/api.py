@@ -12,13 +12,13 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 from urllib.parse import urlencode
 
 import requests
 
 from .content import render_html
-from .models import Article, PublishResult, PublishStatus
+from .models import Article, PublishResult, PublishStatus, _asset_references
 
 
 class WeChatAPIError(RuntimeError):
@@ -45,6 +45,8 @@ class WeChatAPI:
     session: Optional[requests.Session] = None
     poll_interval: float = 2.0
     poll_timeout: float = 120.0
+    submission_checkpoint: Optional[Callable[[str], None]] = None
+    publish_id_checkpoint: Optional[Callable[[str, str], None]] = None
 
     def __post_init__(self) -> None:
         self.session = self.session or requests.Session()
@@ -200,7 +202,7 @@ class WeChatAPI:
             raise WeChatAPIError("提交发布后没有返回 publish_id", submitted=True, draft_id=draft_id)
         return publish_id
 
-    def publish_draft(self, draft_id: str, *, confirm_publish: bool = False) -> PublishResult:
+    def publish_draft(self, draft_id: str, *, confirm_publish: bool = False, publish_id: Optional[str] = None) -> PublishResult:
         """Publish an existing draft without recreating or uploading it."""
         if not confirm_publish:
             return PublishResult(
@@ -210,14 +212,19 @@ class WeChatAPI:
                 draft_id=draft_id,
                 error_code="confirmation_required",
             )
+        query_only = publish_id is not None
         try:
-            publish_id = self.submit_publish(draft_id)
+            if publish_id is None and self.submission_checkpoint:
+                self.submission_checkpoint(draft_id)
+            publish_id = publish_id or self.submit_publish(draft_id)
+            if not query_only and self.publish_id_checkpoint:
+                self.publish_id_checkpoint(draft_id, publish_id)
             deadline = time.monotonic() + self.poll_timeout
             last: Mapping[str, Any] = {}
             while time.monotonic() < deadline:
                 last = self.get_publish_status(publish_id)
                 status = str(last.get("publish_status", last.get("status", ""))).lower()
-                if status in {"1", "published", "success", "成功"}:
+                if status in {"0", "published", "success", "成功"}:
                     return PublishResult(
                         PublishStatus.PUBLISHED,
                         "api",
@@ -227,7 +234,7 @@ class WeChatAPI:
                         article_id=str(last.get("article_id", "")) or None,
                         metadata=dict(last),
                     )
-                if status in {"2", "failed", "fail", "失败"}:
+                if status in {"2", "3", "4", "5", "6", "failed", "fail", "失败"}:
                     return PublishResult(
                         PublishStatus.FAILED,
                         "api",
@@ -253,6 +260,7 @@ class WeChatAPI:
                 "api",
                 str(exc),
                 draft_id=draft_id,
+                publish_id=publish_id,
                 error_code=exc.code or "publish_submit_error",
             )
 
@@ -273,7 +281,9 @@ class WeChatAPI:
                 error_code="confirmation_required",
             )
         try:
-            image_urls = {asset.alias: self.upload_content_image(asset.path) for asset in article.assets}
+            referenced = _asset_references(article.body)
+            image_urls = {asset.alias: self.upload_content_image(asset.path)
+                          for asset in article.assets if asset.alias in referenced}
             html_body = render_html(article, image_urls)
             cover = article.cover_image or (article.assets[0].path if article.assets else None)
             if cover is None:

@@ -30,7 +30,7 @@ class FakeSession:
         if "/cgi-bin/freepublish/submit" in url:
             return FakeResponse({"publish_id": "publish-1"})
         if "/cgi-bin/freepublish/get" in url:
-            return FakeResponse({"publish_status": 1, "article_id": "article-1"})
+            return FakeResponse({"publish_status": 0, "article_id": "article-1"})
         raise AssertionError(f"unexpected URL: {url}")
 
 

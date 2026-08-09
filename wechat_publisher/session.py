@@ -20,6 +20,7 @@ class ProfileBusyError(RuntimeError):
 class ProfileLock:
     """Process lock for one isolated Playwright profile."""
 
+
     def __init__(self, profile_dir: Path, *, timeout: float = 15.0) -> None:
         self.profile_dir = Path(profile_dir).expanduser().resolve()
         self.timeout = timeout
@@ -96,6 +97,8 @@ class RunRecord:
     result: Dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    submit_started_at: Optional[float] = None
+    resource_refs: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -122,6 +125,8 @@ class RunRecord:
             "result": self.result,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "submit_started_at": self.submit_started_at,
+            "resource_refs": self.resource_refs,
         }
 
     @classmethod
@@ -138,10 +143,25 @@ class RunStore:
         self.directory = self.profile_dir / "sessions"
 
     def path(self, run_id: str) -> Path:
-        safe_id = "".join(char for char in run_id if char.isalnum() or char in "-_.")
-        if not safe_id:
-            raise ValueError("run_id 不能为空")
-        return self.directory / f"{safe_id}.json"
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run_id):
+            raise ValueError("run_id 格式无效")
+        return self.directory / f"{run_id}.json"
+
+    def transition(self, run_id: str, expected: tuple[str, ...], new_status: str, *, lock: Optional[ProfileLock] = None, **fields: Any) -> RunRecord:
+        """Atomically checkpoint a state change under the profile lock."""
+        if lock is not None and lock._handle is not None:
+            return self._transition_locked(run_id, expected, new_status, fields)
+        with ProfileLock(self.profile_dir):
+            return self._transition_locked(run_id, expected, new_status, fields)
+
+    def _transition_locked(self, run_id: str, expected: tuple[str, ...], new_status: str, fields: Dict[str, Any]) -> RunRecord:
+            record = self.load(run_id)
+            if record.status not in expected:
+                raise ValueError(f"run 状态不允许迁移: {record.status} -> {new_status}")
+            for key, value in fields.items():
+                setattr(record, key, value)
+            record.status = new_status
+            return self.save(record)
 
     def create(self, run_id: Optional[str] = None, **fields: Any) -> RunRecord:
         record = RunRecord(
@@ -258,7 +278,10 @@ class RunStore:
         fingerprint: str,
         *,
         exclude_run_id: Optional[str] = None,
-        statuses: tuple[str, ...] = ("running", "awaiting_scan", "unknown", "published"),
+        statuses: tuple[str, ...] = (
+            "running", "submitting", "publishing", "awaiting_scan",
+            "unknown", "verification_expired", "published",
+        ),
     ) -> Optional[RunRecord]:
         """Find the newest matching run that could cause a duplicate publish."""
         if not self.directory.is_dir():
@@ -272,10 +295,10 @@ class RunStore:
                 return record
         return None
 
-    def cleanup(self, *, older_than: float, now: Optional[float] = None) -> Dict[str, int]:
+    def cleanup(self, *, older_than: float, now: Optional[float] = None, dry_run: bool = True) -> Dict[str, int]:
         """Remove only finished run records and their run-scoped artifacts."""
         now = now or time.time()
-        protected = {"running", "awaiting_scan", "unknown", "verification_expired"}
+        protected = {"running", "submitting", "publishing", "awaiting_scan", "unknown", "verification_expired"}
         removed_runs = 0
         removed_files = 0
         if not self.directory.is_dir():
@@ -289,6 +312,9 @@ class RunStore:
             if record.status in protected or now - record.updated_at < older_than:
                 continue
             safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", record.run_id)
+            if dry_run:
+                removed_runs += 1
+                continue
             for candidate in (path, self.directory / f"{safe_id}.article.json"):
                 try:
                     candidate.unlink()
@@ -304,3 +330,4 @@ class RunStore:
                         pass
             removed_runs += 1
         return {"runs": removed_runs, "files": removed_files}
+    _held_paths: set[Path] = set()

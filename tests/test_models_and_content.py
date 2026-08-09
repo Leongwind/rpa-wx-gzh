@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from wechat_publisher.content import render_browser_html, render_html
+from wechat_publisher.content import render_browser_html, render_html, sanitize_html
 from wechat_publisher.models import Article, PublishStatus, ValidationError
 
 
@@ -36,10 +36,10 @@ def test_render_html_replaces_asset_token(tmp_path: Path):
     assert 'src="https://example.test/image.png"' in result
 
 
-def test_render_browser_html_uses_local_file_uri(tmp_path: Path):
+def test_render_browser_html_does_not_expose_local_file_uri(tmp_path: Path):
     article = make_article(tmp_path)
     result = render_browser_html(article)
-    assert "file://" in result
+    assert "file://" not in result
 
 
 def test_article_derives_digest_and_uses_first_asset_as_cover(tmp_path: Path):
@@ -77,3 +77,14 @@ def test_asset_is_not_inserted_without_an_explicit_body_reference(tmp_path: Path
     )
 
     assert "<img" not in render_browser_html(article)
+
+
+def test_html_sanitizer_blocks_unquoted_protocols_and_svg():
+    result = sanitize_html('<p onclick=x>ok</p><img src=javascript:alert(1) onerror=x><svg onload=x>bad</svg>')
+    assert "onclick" not in result and "onerror" not in result
+    assert "javascript" not in result and "svg" not in result
+
+
+def test_code_fences_are_not_asset_instructions(tmp_path: Path):
+    article = make_article(tmp_path, "~~~\n{{asset:literal}}\n~~~\n正文")
+    assert "literal" not in article.asset_map()

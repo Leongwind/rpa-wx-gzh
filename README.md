@@ -234,7 +234,7 @@ python -m wechat_publisher publish \
 
 - `login`：运营者微信扫码登录。
 - `publish_verification`：微信安全验证。
-- `admin_approval`：等待公众号管理员确认。
+- `admin_approval` 是扫码流程中的 stage，不是顶层发布结果状态；页面行为仅由本地 mock seam 验证，未宣称真实微信页面已验证。
 
 如果需要手动查看状态：
 
@@ -313,3 +313,13 @@ codegraph sync
 ```
 
 Skill 定义见 [skills/wechat-mp-publisher/SKILL.md](skills/wechat-mp-publisher/SKILL.md)，兼容入口 [main.py](main.py) 只负责转发到新版 CLI。
+
+浏览器草稿的 mock seam 使用 `BrowserDraftAdapter` 显式注入；生产默认路径通过 Playwright 保存并重新打开草稿。回读会逐个核对本次上传的正文图片 alias/URL 以及封面资源身份。
+新建文章会在保存前写入并确认 `Article.digest`（包括派生摘要）；摘要控件缺失或写入结果无法确认时，流程 fail-closed。
+Cleanup is dry-run by default; use `cleanup --apply` only after reviewing the
+reported files. `doctor --json` performs local, side-effect-free diagnostics
+without opening WeChat or reading credential values. Browser drafts require
+save, leave/reopen through the draft seam, and read-back verification of the
+actual digest, cover, and body image aliases. Final publication requires the
+same read-back and an observed disabled notification guard; these guarantees
+are covered by local mock seams.

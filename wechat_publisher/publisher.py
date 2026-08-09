@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
@@ -66,6 +67,13 @@ class AutoPublisher:
                     )
             except KeyError:
                 store.create(run_id)
+                record = store.load(run_id)
+            protected = {
+                "submitting", "publishing", "unknown", "awaiting_scan",
+                "verification_expired", "published",
+            }
+            if record.status in protected:
+                return PublishResult(PublishStatus.UNKNOWN, record.provider, f"run 已处于保护状态: {record.status}", error_code="run_protected", run_id=run_id)
             store.save_article(run_id, effective_article)
             if effective_article.publish and not force_republish:
                 duplicate = store.find_by_fingerprint(
@@ -92,6 +100,14 @@ class AutoPublisher:
             ))
 
         if mode in {"auto", "api", "draft"} and self.api is not None:
+            if run_id and effective_article.publish:
+                self.api.submission_checkpoint = lambda draft_id: store.transition(
+                    run_id, ("running",), "submitting", submit_started_at=time.time(),
+                    result={"draft_id": draft_id, "status": "submitting", "provider": "api"}
+                )
+                self.api.publish_id_checkpoint = lambda draft_id, publish_id: store.update(
+                    run_id, result={"draft_id": draft_id, "publish_id": publish_id, "status": "submitting", "provider": "api"}
+                )
             result = self.api.publish(effective_article, confirm_publish=confirm_publish)
             if mode in {"api", "draft"} or result.status in {
                 PublishStatus.PUBLISHED,
@@ -164,6 +180,14 @@ class AutoPublisher:
             article = store.load_article(run_id)
         except (KeyError, ValueError) as exc:
             return PublishResult(PublishStatus.FAILED, "none", str(exc), error_code="run_not_found", run_id=run_id)
+        if record.status in {"submitting", "unknown", "verification_expired", "publishing"} and record.result.get("publish_id"):
+            if self.api is not None:
+                self.api.submission_checkpoint = None
+                self.api.publish_id_checkpoint = None
+                return self._record_result(store, run_id, article, self.api.publish_draft(
+                    str(record.result.get("draft_id") or ""), confirm_publish=True,
+                    publish_id=str(record.result["publish_id"])))
+            return PublishResult(PublishStatus.UNKNOWN, record.provider, "已有提交引用但无法查询原任务", error_code="provider_unavailable", run_id=run_id)
         if record.status != PublishStatus.DRAFT_CREATED.value:
             return PublishResult(
                 PublishStatus.FAILED,
@@ -182,6 +206,14 @@ class AutoPublisher:
             )
         draft_id = record.result.get("draft_id") if record.result else None
         if record.provider == "api" and self.api is not None and draft_id:
+            if hasattr(self.api, "submission_checkpoint"):
+                self.api.submission_checkpoint = lambda draft: store.transition(
+                run_id, ("draft_created",), "submitting", submit_started_at=time.time(),
+                result={"draft_id": draft, "status": "submitting", "provider": "api"}
+                )
+                self.api.publish_id_checkpoint = lambda draft, publish: store.update(
+                run_id, result={"draft_id": draft, "publish_id": publish, "status": "submitting", "provider": "api"}
+                )
             result = self.api.publish_draft(str(draft_id), confirm_publish=True)
             return self._record_result(store, run_id, article, result)
         if self.browser is None:
