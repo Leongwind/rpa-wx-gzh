@@ -44,6 +44,7 @@ def article(tmp_path: Path) -> Article:
             "body_format": "markdown",
             "cover_image": str(image),
             "assets": [{"alias": "hero", "path": str(image)}],
+            "publish": True,
         }
     )
 
@@ -63,3 +64,47 @@ def test_api_requires_explicit_confirmation(tmp_path: Path):
     result = api.publish(article(tmp_path), confirm_publish=False)
     assert result.status is PublishStatus.FAILED
     assert result.error_code == "confirmation_required"
+
+
+def test_api_retries_transient_server_error_before_submission(tmp_path: Path):
+    class FlakySession(FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.failures = 1
+
+        def request(self, method, url, timeout, **kwargs):
+            if self.failures and "/cgi-bin/token" in url:
+                self.failures -= 1
+                return FakeResponse({}, status_code=503)
+            return super().request(method, url, timeout, **kwargs)
+
+    session = FlakySession()
+    api = WeChatAPI("appid", "secret", session=session, poll_interval=0, poll_timeout=1)
+    result = api.publish(article(tmp_path), confirm_publish=True)
+
+    assert result.status is PublishStatus.PUBLISHED
+
+
+def test_api_maps_article_metadata_to_draft_payload(tmp_path: Path):
+    session = FakeSession()
+    value = article(tmp_path)
+    value = Article.from_dict(
+        {
+            **value.to_dict(),
+            "author": "作者",
+            "source_url": "https://example.test/source",
+            "need_open_comment": True,
+            "only_fans_can_comment": True,
+            "publish": False,
+        }
+    )
+    api = WeChatAPI("appid", "secret", session=session, poll_interval=0, poll_timeout=1)
+    result = api.publish(value, confirm_publish=False)
+
+    assert result.status is PublishStatus.DRAFT_CREATED
+    draft_calls = [call for call in session.calls if "/cgi-bin/draft/add" in call[1]]
+    payload = draft_calls[0][2]["json"]["articles"][0]
+    assert payload["author"] == "作者"
+    assert payload["content_source_url"] == "https://example.test/source"
+    assert payload["need_open_comment"] == 1
+    assert payload["only_fans_can_comment"] == 1

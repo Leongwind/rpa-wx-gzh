@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -50,9 +51,13 @@ class Article:
     body: str
     body_format: str = "markdown"
     digest: str = ""
+    author: str = ""
+    source_url: str = ""
+    need_open_comment: bool = False
+    only_fans_can_comment: bool = False
     cover_image: Optional[Path] = None
     assets: List[Asset] = field(default_factory=list)
-    publish: bool = True
+    publish: bool = False
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "Article":
@@ -100,9 +105,13 @@ class Article:
             body=body,
             body_format=body_format,
             digest=digest,
+            author=str(value.get("author", "") or "").strip(),
+            source_url=str(value.get("source_url", value.get("content_source_url", "")) or "").strip(),
+            need_open_comment=bool(value.get("need_open_comment", False)),
+            only_fans_can_comment=bool(value.get("only_fans_can_comment", False)),
             cover_image=cover_image,
             assets=assets,
-            publish=bool(value.get("publish", True)),
+            publish=bool(value.get("publish", False)),
         )
 
     @classmethod
@@ -115,6 +124,46 @@ class Article:
 
     def asset_map(self) -> Dict[str, Path]:
         return {asset.alias: asset.path for asset in self.assets}
+
+    def fingerprint(self) -> str:
+        """Return a content identity that is independent of local file paths."""
+        digest = hashlib.sha256()
+        for value in (
+            self.title,
+            self.body_format,
+            self.digest,
+            self.author,
+            self.source_url,
+            str(self.need_open_comment),
+            str(self.only_fans_can_comment),
+            self.body,
+        ):
+            digest.update(value.encode("utf-8"))
+            digest.update(b"\0")
+        if self.cover_image:
+            digest.update(b"cover\0")
+            digest.update(_file_digest(self.cover_image).encode("ascii"))
+        for asset in self.assets:
+            digest.update(asset.alias.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(_file_digest(asset.path).encode("ascii"))
+        return digest.hexdigest()
+
+    def confirmation_summary(self) -> Dict[str, Any]:
+        """Return safe metadata for the final external-side-effect review."""
+        return {
+            "title": self.title,
+            "body_format": self.body_format,
+            "digest": self.digest,
+            "author": self.author,
+            "source_url": self.source_url,
+            "need_open_comment": self.need_open_comment,
+            "only_fans_can_comment": self.only_fans_can_comment,
+            "cover_image": str(self.cover_image) if self.cover_image else None,
+            "assets": [asset.alias for asset in self.assets],
+            "body_preview": derive_digest(self.body, limit=160),
+            "publish": self.publish,
+        }
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -191,3 +240,11 @@ def derive_digest(body: str, *, limit: int = 120) -> str:
     text = html.unescape(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:limit]
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

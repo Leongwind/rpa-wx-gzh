@@ -4,12 +4,67 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+
+class ProfileBusyError(RuntimeError):
+    """Raised when another publisher is using the same browser profile."""
+
+
+class ProfileLock:
+    """Process lock for one isolated Playwright profile."""
+
+    def __init__(self, profile_dir: Path, *, timeout: float = 15.0) -> None:
+        self.profile_dir = Path(profile_dir).expanduser().resolve()
+        self.timeout = timeout
+        self.path = self.profile_dir / ".publisher.lock"
+        self._handle = None
+
+    def acquire(self) -> "ProfileLock":
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            try:
+                import fcntl
+
+                handle = self.path.open("a+", encoding="utf-8")
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle.seek(0)
+                handle.truncate()
+                handle.write(f"pid={os.getpid()}\ntime={time.time()}\n")
+                handle.flush()
+                self._handle = handle
+                return self
+            except (BlockingIOError, OSError):
+                try:
+                    handle.close()
+                except UnboundLocalError:
+                    pass
+                time.sleep(0.1)
+        raise ProfileBusyError(f"Playwright profile 正在被其他发布任务使用: {self.profile_dir}")
+
+    def release(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            import fcntl
+
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._handle.close()
+            self._handle = None
+
+    def __enter__(self) -> "ProfileLock":
+        return self.acquire()
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.release()
 
 
 def new_run_id() -> str:
@@ -25,6 +80,8 @@ class RunRecord:
     artifact_dir: str = ""
     article_path: Optional[str] = None
     article_title: Optional[str] = None
+    fingerprint: Optional[str] = None
+    confirmation_summary: Dict[str, Any] = field(default_factory=dict)
     debug_port: Optional[int] = None
     qrcode_path: Optional[str] = None
     stage: Optional[str] = None
@@ -49,6 +106,8 @@ class RunRecord:
             "artifact_dir": self.artifact_dir,
             "article_path": self.article_path,
             "article_title": self.article_title,
+            "fingerprint": self.fingerprint,
+            "confirmation_summary": self.confirmation_summary,
             "debug_port": self.debug_port,
             "qrcode_path": self.qrcode_path,
             "stage": self.stage,
@@ -164,7 +223,13 @@ class RunStore:
                 os.unlink(temp_name)
             except FileNotFoundError:
                 pass
-        self.update(run_id, article_path=str(path), article_title=article.title)
+        self.update(
+            run_id,
+            article_path=str(path),
+            article_title=article.title,
+            fingerprint=article.fingerprint(),
+            confirmation_summary=article.confirmation_summary(),
+        )
         return str(path)
 
     def load_article(self, run_id: str) -> Any:
@@ -187,3 +252,55 @@ class RunStore:
             if record.status in {"running", "awaiting_scan", "unknown", "verification_expired"} and record.debug_port:
                 records.append(record)
         return records
+
+    def find_by_fingerprint(
+        self,
+        fingerprint: str,
+        *,
+        exclude_run_id: Optional[str] = None,
+        statuses: tuple[str, ...] = ("running", "awaiting_scan", "unknown", "published"),
+    ) -> Optional[RunRecord]:
+        """Find the newest matching run that could cause a duplicate publish."""
+        if not self.directory.is_dir():
+            return None
+        for path in sorted(self.directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            try:
+                record = RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError, TypeError, KeyError):
+                continue
+            if record.run_id != exclude_run_id and record.fingerprint == fingerprint and record.status in statuses:
+                return record
+        return None
+
+    def cleanup(self, *, older_than: float, now: Optional[float] = None) -> Dict[str, int]:
+        """Remove only finished run records and their run-scoped artifacts."""
+        now = now or time.time()
+        protected = {"running", "awaiting_scan", "unknown", "verification_expired"}
+        removed_runs = 0
+        removed_files = 0
+        if not self.directory.is_dir():
+            return {"runs": 0, "files": 0}
+        artifact_dir = self.profile_dir / "artifacts"
+        for path in list(self.directory.glob("*.json")):
+            try:
+                record = RunRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError, TypeError, KeyError):
+                continue
+            if record.status in protected or now - record.updated_at < older_than:
+                continue
+            safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", record.run_id)
+            for candidate in (path, self.directory / f"{safe_id}.article.json"):
+                try:
+                    candidate.unlink()
+                    removed_files += 1
+                except FileNotFoundError:
+                    pass
+            if artifact_dir.is_dir():
+                for candidate in artifact_dir.glob(f"*{safe_id}*"):
+                    try:
+                        candidate.unlink()
+                        removed_files += 1
+                    except FileNotFoundError:
+                        pass
+            removed_runs += 1
+        return {"runs": removed_runs, "files": removed_files}

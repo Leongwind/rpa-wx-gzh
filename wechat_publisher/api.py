@@ -8,6 +8,7 @@ duplicate article through the browser fallback.
 from __future__ import annotations
 
 import mimetypes
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,13 +69,25 @@ class WeChatAPI:
         return payload
 
     def _request(self, method: str, path: str, *, params: Optional[Dict[str, str]] = None, **kwargs: Any) -> Mapping[str, Any]:
-        try:
-            response = self.session.request(method, self._url(path, **(params or {})), timeout=self.timeout, **kwargs)
-        except requests.RequestException as exc:
-            raise WeChatAPIError(f"微信 API 网络请求失败: {exc}") from exc
-        if response.status_code >= 500:
-            raise WeChatAPIError(f"微信 API 服务端错误: HTTP {response.status_code}")
-        return self._json_response(response)
+        retryable = path != "/cgi-bin/freepublish/submit"
+        last_error: Optional[Exception] = None
+        for attempt in range(3 if retryable else 1):
+            try:
+                response = self.session.request(method, self._url(path, **(params or {})), timeout=self.timeout, **kwargs)
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt + 1 >= (3 if retryable else 1):
+                    raise WeChatAPIError(f"微信 API 网络请求失败: {_redact(str(exc))}") from exc
+                time.sleep(0.5 * (2**attempt))
+                continue
+            if response.status_code == 429 or response.status_code >= 500:
+                last_error = WeChatAPIError(f"微信 API 服务端错误: HTTP {response.status_code}")
+                if attempt + 1 >= (3 if retryable else 1):
+                    raise last_error
+                time.sleep(0.5 * (2**attempt))
+                continue
+            return self._json_response(response)
+        raise WeChatAPIError(f"微信 API 请求失败: {_redact(str(last_error))}")
 
     def access_token(self) -> str:
         if self._access_token:
@@ -128,13 +141,13 @@ class WeChatAPI:
                 "articles": [
                     {
                         "title": article.title,
-                        "author": "",
+                        "author": article.author,
                         "digest": article.digest,
                         "content": html_body,
-                        "content_source_url": "",
+                        "content_source_url": article.source_url,
                         "thumb_media_id": cover_media_id,
-                        "need_open_comment": 0,
-                        "only_fans_can_comment": 0,
+                        "need_open_comment": int(article.need_open_comment),
+                        "only_fans_can_comment": int(article.only_fans_can_comment),
                     }
                 ]
             },
@@ -159,32 +172,17 @@ class WeChatAPI:
             raise WeChatAPIError("提交发布后没有返回 publish_id", submitted=True, draft_id=draft_id)
         return publish_id
 
-    def get_publish_status(self, publish_id: str) -> Mapping[str, Any]:
-        return self._request(
-            "POST",
-            "/cgi-bin/freepublish/get",
-            params=self._token_params(),
-            json={"publish_id": publish_id},
-        )
-
-    def publish(self, article: Article, *, confirm_publish: bool = False) -> PublishResult:
-        if not confirm_publish and article.publish:
+    def publish_draft(self, draft_id: str, *, confirm_publish: bool = False) -> PublishResult:
+        """Publish an existing draft without recreating or uploading it."""
+        if not confirm_publish:
             return PublishResult(
                 PublishStatus.FAILED,
                 "api",
-                "发布文章必须显式传入 confirm_publish=True",
+                "发布草稿必须显式传入 confirm_publish=True",
+                draft_id=draft_id,
                 error_code="confirmation_required",
             )
         try:
-            image_urls = {asset.alias: self.upload_content_image(asset.path) for asset in article.assets}
-            html_body = render_html(article, image_urls)
-            cover = article.cover_image or (article.assets[0].path if article.assets else None)
-            if cover is None:
-                raise WeChatAPIError("API 发布需要 cover_image 或至少一个正文图片")
-            draft_id = self.create_draft(article, html_body, self.upload_permanent_image(cover))
-            if not article.publish:
-                return PublishResult(PublishStatus.DRAFT_CREATED, "api", "草稿创建成功", draft_id=draft_id)
-
             publish_id = self.submit_publish(draft_id)
             deadline = time.monotonic() + self.poll_timeout
             last: Mapping[str, Any] = {}
@@ -223,9 +221,49 @@ class WeChatAPI:
             )
         except WeChatAPIError as exc:
             return PublishResult(
+                PublishStatus.UNKNOWN,
+                "api",
+                str(exc),
+                draft_id=draft_id,
+                error_code=exc.code or "publish_submit_error",
+            )
+
+    def get_publish_status(self, publish_id: str) -> Mapping[str, Any]:
+        return self._request(
+            "POST",
+            "/cgi-bin/freepublish/get",
+            params=self._token_params(),
+            json={"publish_id": publish_id},
+        )
+
+    def publish(self, article: Article, *, confirm_publish: bool = False) -> PublishResult:
+        if not confirm_publish and article.publish:
+            return PublishResult(
+                PublishStatus.FAILED,
+                "api",
+                "发布文章必须显式传入 confirm_publish=True",
+                error_code="confirmation_required",
+            )
+        try:
+            image_urls = {asset.alias: self.upload_content_image(asset.path) for asset in article.assets}
+            html_body = render_html(article, image_urls)
+            cover = article.cover_image or (article.assets[0].path if article.assets else None)
+            if cover is None:
+                raise WeChatAPIError("API 发布需要 cover_image 或至少一个正文图片")
+            draft_id = self.create_draft(article, html_body, self.upload_permanent_image(cover))
+            if not article.publish:
+                return PublishResult(PublishStatus.DRAFT_CREATED, "api", "草稿创建成功", draft_id=draft_id)
+
+            return self.publish_draft(draft_id, confirm_publish=confirm_publish)
+        except WeChatAPIError as exc:
+            return PublishResult(
                 PublishStatus.UNKNOWN if exc.submitted else PublishStatus.FAILED,
                 "api",
                 str(exc),
                 draft_id=exc.draft_id,
                 error_code=exc.code or "api_error",
             )
+
+
+def _redact(value: str) -> str:
+    return re.sub(r"((?:access_token|secret)=)[^&\s]+", r"\1<redacted>", value, flags=re.IGNORECASE)

@@ -7,7 +7,7 @@ from wechat_publisher.publisher import AutoPublisher
 def article(tmp_path: Path) -> Article:
     cover = tmp_path / "cover.png"
     cover.write_bytes(b"png")
-    return Article.from_dict({"title": "测试", "body": "正文", "cover_image": str(cover)})
+    return Article.from_dict({"title": "测试", "body": "正文", "cover_image": str(cover), "publish": True})
 
 
 class FailingAPI:
@@ -52,3 +52,64 @@ def test_real_publish_without_cover_fails_before_provider_calls():
 
     assert result.status is PublishStatus.FAILED
     assert result.error_code == "cover_required"
+
+
+def test_auto_publisher_blocks_duplicate_content(tmp_path: Path):
+    class Browser:
+        profile_dir = tmp_path / "profile"
+
+        def publish(self, article, *, confirm_publish, run_id=None):
+            return PublishResult(PublishStatus.PUBLISHED, "browser", "已发布", run_id=run_id)
+
+    publisher = AutoPublisher(browser=Browser())
+    first = publisher.publish(article(tmp_path), mode="browser", confirm_publish=True, run_id="wx-first")
+    second = publisher.publish(article(tmp_path), mode="browser", confirm_publish=True, run_id="wx-second")
+
+    assert first.status is PublishStatus.PUBLISHED
+    assert second.status is PublishStatus.FAILED
+    assert second.error_code == "duplicate_content"
+
+
+def test_auto_publisher_allows_explicit_duplicate_override(tmp_path: Path):
+    class Browser:
+        profile_dir = tmp_path / "profile"
+
+        def publish(self, article, *, confirm_publish, run_id=None):
+            return PublishResult(PublishStatus.PUBLISHED, "browser", "已发布", run_id=run_id)
+
+    publisher = AutoPublisher(browser=Browser())
+    publisher.publish(article(tmp_path), mode="browser", confirm_publish=True, run_id="wx-first")
+    result = publisher.publish(
+        article(tmp_path),
+        mode="browser",
+        confirm_publish=True,
+        run_id="wx-second",
+        force_republish=True,
+    )
+
+    assert result.status is PublishStatus.PUBLISHED
+
+
+def test_publish_run_reuses_existing_api_draft(tmp_path: Path):
+    class DraftAPI:
+        def publish_draft(self, draft_id, *, confirm_publish):
+            assert draft_id == "draft-1"
+            assert confirm_publish is True
+            return PublishResult(PublishStatus.PUBLISHED, "api", "已发布", draft_id=draft_id)
+
+    profile = tmp_path / "profile"
+    browser = type("Browser", (), {"profile_dir": profile})()
+    from wechat_publisher.session import RunStore
+
+    store = RunStore(profile)
+    store.create("wx-draft")
+    store.save_article("wx-draft", article(tmp_path))
+    store.save_result(
+        "wx-draft",
+        PublishResult(PublishStatus.DRAFT_CREATED, "api", "草稿创建成功", draft_id="draft-1", run_id="wx-draft"),
+    )
+
+    result = AutoPublisher(api=DraftAPI(), browser=browser).publish_run("wx-draft", confirm_publish=True)
+
+    assert result.status is PublishStatus.PUBLISHED
+    assert result.draft_id == "draft-1"

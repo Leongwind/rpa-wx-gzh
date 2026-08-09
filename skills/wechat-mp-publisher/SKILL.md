@@ -8,6 +8,11 @@ description: Create a WeChat Official Account article from the user's current re
 Use the repository's API/Playwright publisher. Do not call the legacy Selenium
 flow in `main.py` or `modules/login.py`.
 
+Run from the active project workspace. The installed Skill wrapper discovers the
+repository from the current directory or `WX_GZH_ROOT`; after environment setup,
+`pip install -e .` also provides the `wechat-publisher` command inside the active
+Anaconda environment.
+
 ## Build the article from the current request
 
 The article is supplied by the user; never reuse `article.acceptance.json`, a
@@ -37,6 +42,10 @@ Payload shape:
   "body": "用户提供的正文，可使用 {{asset:image1}}",
   "body_format": "markdown",
   "digest": "可选摘要",
+  "author": "可选作者",
+  "source_url": "可选原文链接",
+  "need_open_comment": false,
+  "only_fans_can_comment": false,
   "cover_image": "/absolute/path/cover.png",
   "assets": [{"alias": "image1", "path": "/absolute/path/image1.png"}],
   "publish": false
@@ -62,6 +71,15 @@ python -m wechat_publisher publish \
 For a confirmed real publication, add `--confirm-publish`. For an explicit
 draft request, use `--mode draft`. The CLI also accepts `--input -` when a
 caller supplies the JSON through standard input.
+
+Before requesting confirmation for a real publication, show the user the
+final title, digest, cover, body-image aliases, selected mode, and the fact
+that group notification is disabled. A caller can inspect the same summary
+without side effects by adding `--preview`.
+
+The publisher fingerprints article content and blocks a matching running,
+unknown, or published run by default. Only after checking the Official Account
+console may a user explicitly add `--force-republish` for an intentional repeat.
 
 If the result is `awaiting_scan`, render the absolute `qrcode_path` as an
 in-conversation image card. Show the article title, scan stage, next action,
@@ -94,8 +112,17 @@ Public recovery commands are:
 python -m wechat_publisher status --run-id <run-id> --json
 python -m wechat_publisher resume --run-id <run-id> --json
 python -m wechat_publisher cancel --run-id <run-id> --json
+python -m wechat_publisher cleanup --older-than 604800 --json
 ```
 
 The publisher uses unique QR files per `run_id` and generation, refreshes only
 the current verification challenge once after expiry, and never clicks
 `发表` again to resubmit an already submitted article.
+
+For long delays between preparation and publication, first create a draft and
+keep its returned `run_id`, then publish that saved draft after reviewing it:
+
+```bash
+python -m wechat_publisher publish --input article.json --mode draft --json
+python -m wechat_publisher publish --run-id <run-id> --confirm-publish --json
+```

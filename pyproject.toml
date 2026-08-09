@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wechat-mp-publisher"
+version = "0.1.0"
+description = "微信公众号文章草稿和发布工具"
+requires-python = ">=3.11"
+dependencies = [
+  "markdown>=3.5,<4",
+  "pillow>=8.0",
+  "playwright>=1.40,<2",
+  "requests>=2.31,<3",
+]
+
+[project.scripts]
+wechat-publisher = "wechat_publisher.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wechat_publisher*"]

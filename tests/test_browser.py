@@ -46,7 +46,7 @@ def test_recent_publish_record_must_be_newer_than_run(tmp_path: Path):
 def test_browser_requires_confirmation_before_external_publish(tmp_path: Path):
     cover = tmp_path / "cover.png"
     cover.write_bytes(b"png")
-    article = Article.from_dict({"title": "浏览器测试", "body": "正文", "cover_image": str(cover)})
+    article = Article.from_dict({"title": "浏览器测试", "body": "正文", "cover_image": str(cover), "publish": True})
     result = BrowserPublisher(tmp_path / "profile").publish(article, confirm_publish=False)
     assert result.status is PublishStatus.FAILED
     assert result.error_code == "confirmation_required"
@@ -198,4 +198,31 @@ def test_cover_selection_keeps_an_already_selected_image(tmp_path: Path):
 
         assert "selected" in page.locator("li.appmsg_content_img_item").get_attribute("class")
         assert page.locator("body").get_attribute("data-confirmed") == "yes"
+        browser.close()
+
+
+def test_cover_upload_cleanup_does_not_leave_cover_in_body(tmp_path: Path):
+    sync_playwright = __import__("playwright.sync_api", fromlist=["sync_playwright"]).sync_playwright
+    executable = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    if not executable.is_file():
+        pytest.skip("本机没有可用于浏览器模拟的 Chrome")
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, executable_path=str(executable))
+        page = browser.new_page()
+        page.set_content(
+            """
+            <div class='mock-iframe'>
+              <div class='ProseMirror' contenteditable='true'>
+                <p><img class='rich_pages' src='body.png'></p>
+                <p><img class='rich_pages' src='temporary-cover.png'></p>
+              </div>
+            </div>
+            """
+        )
+
+        BrowserPublisher(tmp_path / "profile")._remove_temporary_cover_image(page, 1)
+
+        assert page.locator("div.mock-iframe img.rich_pages").count() == 1
+        assert page.locator("div.mock-iframe img.rich_pages").first.get_attribute("src") == "body.png"
         browser.close()

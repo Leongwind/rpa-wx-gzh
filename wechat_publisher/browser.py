@@ -15,8 +15,8 @@ from mimetypes import guess_type
 from typing import Any, Iterable, Optional
 
 from .content import render_browser_html
-from .models import Article, PublishResult, PublishStatus
-from .session import RunStore
+from .models import Article, PublishResult, PublishStatus, derive_digest
+from .session import ProfileBusyError, ProfileLock, RunStore
 
 
 class PlaywrightUnavailable(RuntimeError):
@@ -466,11 +466,35 @@ class BrowserPublisher:
                 style = preview.get_attribute("style") or ""
                 has_image = bool(re.search(r"background-image\s*:\s*url\((?![\"']?\s*[\"']?\))", style))
                 if preview.is_visible(timeout=500) and has_image:
+                    self._remove_temporary_cover_image(page, before_images)
                     return
             except Exception:
                 pass
             time.sleep(0.5)
         raise RuntimeError("封面上传后未出现预览")
+
+    @staticmethod
+    def _remove_temporary_cover_image(page: Any, before_images: int) -> None:
+        """Remove the body image used only to populate the cover picker."""
+        images = page.locator("div.mock-iframe img.rich_pages")
+        if images.count() <= before_images:
+            return
+        temporary = images.last
+        temporary.evaluate(
+            """
+            node => {
+              const paragraph = node.closest('p');
+              if (paragraph && paragraph.querySelectorAll('img').length === 1) {
+                paragraph.remove();
+              } else {
+                node.remove();
+              }
+            }
+            """
+        )
+        editor = page.locator("div.mock-iframe .ProseMirror[contenteditable='true']").first
+        if editor.count():
+            editor.dispatch_event("input", {"inputType": "deleteContentBackward"})
 
     def _select_body_cover_in_dialog(self, page: Any) -> None:
         """Select the image itself and advance through the cover dialogs.
@@ -804,6 +828,29 @@ class BrowserPublisher:
             page.wait_for_timeout(500)
         return page
 
+    def _open_saved_draft_editor(self, context: Any, page: Any, title: str) -> Any:
+        """Open the newest visible draft matching the saved article title."""
+        page.goto(self.base_url, wait_until="domcontentloaded")
+        all_drafts = page.get_by_role("button", name="全部草稿", exact=True)
+        if all_drafts.count() and all_drafts.first.is_visible(timeout=1000):
+            all_drafts.first.click()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            candidates = page.get_by_text(title, exact=True)
+            for index in range(candidates.count() - 1, -1, -1):
+                candidate = candidates.nth(index)
+                try:
+                    if candidate.is_visible(timeout=200):
+                        candidate.click(force=True)
+                        page.wait_for_timeout(800)
+                        for editor_page in reversed(context.pages):
+                            if editor_page.locator("textarea#title, input[placeholder*='标题'], div[name='title']").count():
+                                return editor_page
+                except Exception:
+                    continue
+            page.wait_for_timeout(300)
+        raise RuntimeError(f"未找到标题为 {title!r} 的可恢复草稿")
+
     def _wait_for_final_result(
         self,
         page: Any,
@@ -1004,6 +1051,19 @@ class BrowserPublisher:
         return process.pid
 
     def watch(self, run_id: str) -> PublishResult:
+        try:
+            with ProfileLock(self.profile_dir, timeout=max(15.0, self.poll_interval * 10)):
+                return self._watch_unlocked(run_id)
+        except ProfileBusyError as exc:
+            return PublishResult(
+                PublishStatus.FAILED,
+                "browser",
+                str(exc),
+                error_code="profile_busy",
+                run_id=run_id,
+            )
+
+    def _watch_unlocked(self, run_id: str) -> PublishResult:
         """Monitor login or publish verification without submitting again."""
         store = RunStore(self.profile_dir)
         try:
@@ -1042,7 +1102,7 @@ class BrowserPublisher:
                         if self._logged_in(page):
                             article = store.load_article(run_id)
                             store.update(run_id, watcher_pid=None, watcher_status="not_started")
-                            return self.publish(article, confirm_publish=article.publish, run_id=run_id)
+                            return self._publish_unlocked(article, confirm_publish=article.publish, run_id=run_id)
                         body = self._body_text(page)
                         if not body:
                             time.sleep(self.poll_interval)
@@ -1195,6 +1255,200 @@ class BrowserPublisher:
         ).to_dict()
 
     def publish(self, article: Article, *, confirm_publish: bool = False, run_id: Optional[str] = None) -> PublishResult:
+        try:
+            with ProfileLock(self.profile_dir, timeout=15.0):
+                return self._publish_unlocked(article, confirm_publish=confirm_publish, run_id=run_id)
+        except ProfileBusyError as exc:
+            return PublishResult(
+                PublishStatus.FAILED,
+                "browser",
+                str(exc),
+                error_code="profile_busy",
+                run_id=run_id,
+            )
+
+    def publish_existing(self, run_id: str, *, confirm_publish: bool = False) -> PublishResult:
+        """Reopen a saved browser draft and publish it with a fresh session."""
+        try:
+            with ProfileLock(self.profile_dir, timeout=15.0):
+                return self._publish_existing_unlocked(run_id, confirm_publish=confirm_publish)
+        except ProfileBusyError as exc:
+            return PublishResult(PublishStatus.FAILED, "browser", str(exc), error_code="profile_busy", run_id=run_id)
+
+    def _publish_existing_unlocked(self, run_id: str, *, confirm_publish: bool) -> PublishResult:
+        store = RunStore(self.profile_dir)
+        try:
+            record = store.load(run_id)
+            article = store.load_article(run_id)
+        except (KeyError, ValueError) as exc:
+            return PublishResult(PublishStatus.FAILED, "browser", str(exc), error_code="run_not_found", run_id=run_id)
+        if record.status != PublishStatus.DRAFT_CREATED.value:
+            return PublishResult(
+                PublishStatus.FAILED,
+                "browser",
+                f"只有 draft_created 会话可以重新发布，当前状态为 {record.status}",
+                error_code="run_not_publishable",
+                run_id=run_id,
+            )
+        if not confirm_publish:
+            return PublishResult(
+                PublishStatus.FAILED,
+                "browser",
+                "发布草稿必须显式传入 confirm_publish=True",
+                error_code="confirmation_required",
+                run_id=run_id,
+            )
+        sync_playwright = self._import_playwright()
+        output_dir = self.profile_dir / "artifacts"
+        last_result: Optional[PublishResult] = None
+        with sync_playwright() as playwright:
+            browser, context = self._connect_cdp_context(playwright, run_id, store)
+            page = context.pages[0] if context.pages else context.new_page()
+            try:
+                login_result = self._ensure_login(page, output_dir, run_id=run_id)
+                if login_result:
+                    result = replace(login_result, run_id=run_id)
+                    store.save_result(run_id, result)
+                    last_result = result
+                    if result.status is PublishStatus.AWAITING_SCAN:
+                        self._start_watcher(run_id)
+                    return result
+                page = self._open_saved_draft_editor(context, page, article.title)
+                title_text = page.locator("div[name='title'] .ProseMirror[contenteditable='true']").inner_text(timeout=5000)
+                body_text = page.locator("div.mock-iframe .ProseMirror[contenteditable='true']").inner_text(timeout=5000)
+                if article.title not in title_text or not derive_digest(article.body, limit=60)[:20] in body_text:
+                    return PublishResult(
+                        PublishStatus.FAILED,
+                        "browser",
+                        "恢复的草稿内容与运行快照不一致，已停止发布",
+                        error_code="draft_content_mismatch",
+                        run_id=run_id,
+                    )
+                result = self._submit_current_editor(context, page, output_dir, run_id=run_id)
+                result = replace(result, run_id=run_id, metadata={**result.metadata, "confirmation_summary": article.confirmation_summary()})
+                store.save_result(run_id, result)
+                last_result = result
+                if result.status is PublishStatus.AWAITING_SCAN:
+                    self._start_watcher(run_id)
+                return result
+            except Exception as exc:
+                result = PublishResult(PublishStatus.FAILED, "browser", f"恢复草稿发布失败: {exc}", error_code="browser_error", run_id=run_id)
+                store.save_result(run_id, result)
+                last_result = result
+                return result
+            finally:
+                if last_result and last_result.status not in {
+                    PublishStatus.AWAITING_SCAN,
+                    PublishStatus.UNKNOWN,
+                    PublishStatus.VERIFICATION_EXPIRED,
+                }:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+
+    def _submit_current_editor(
+        self,
+        context: Any,
+        page: Any,
+        output_dir: Path,
+        *,
+        run_id: Optional[str] = None,
+    ) -> PublishResult:
+        """Submit the currently open editor without refilling its content."""
+        if not self._click_text(page, "发表"):
+            return PublishResult(PublishStatus.FAILED, "browser", "未找到发表按钮", error_code="publish_button_missing", run_id=run_id)
+        page.wait_for_timeout(2500)
+        final_visible = page.locator("button.weui-desktop-btn_primary").filter(has_text="发表").last
+        if not self._has_visible_text(page, "继续发表") and not final_visible.is_visible(timeout=500):
+            modal_already_open = any(
+                self._has_visible_text(page, text)
+                for text in ("群发通知", "今天还有", "今天没有通知次数", "定时发表")
+            )
+            if modal_already_open:
+                clicked_confirmation = self._click_publish_confirmation(page)
+                if clicked_confirmation:
+                    page.wait_for_timeout(1000)
+            else:
+                clicked_confirmation = False
+            if not clicked_confirmation:
+                page.locator(".mass_send").click()
+        else:
+            clicked_confirmation = self._click_publish_confirmation(page)
+        if not clicked_confirmation:
+            continue_button = page.get_by_role("button", name="继续发表", exact=True)
+            if continue_button.count() == 1 and continue_button.is_visible(timeout=500):
+                continue_button.click()
+                clicked_confirmation = True
+        if not clicked_confirmation:
+            screenshot = output_dir / "wechat_publish_confirmation_missing.png"
+            try:
+                page.screenshot(path=str(screenshot), full_page=True)
+            except Exception:
+                screenshot = None
+            return PublishResult(
+                PublishStatus.FAILED,
+                "browser",
+                "未确认点击发表弹窗，已阻止生成无效验证二维码",
+                qrcode_path=str(screenshot) if screenshot else None,
+                error_code="publish_confirmation_missing",
+                run_id=run_id,
+            )
+        page.wait_for_timeout(1000)
+        clicked_continue = self._click_continue_publish(page)
+        page.wait_for_timeout(1000)
+        if not clicked_continue or self._has_visible_text(page, "继续发表"):
+            screenshot = output_dir / "wechat_publish_confirmation_stuck.png"
+            try:
+                page.screenshot(path=str(screenshot), full_page=True)
+            except Exception:
+                screenshot = None
+            return PublishResult(
+                PublishStatus.FAILED,
+                "browser",
+                "继续发表弹窗未关闭，已阻止捕获二维码",
+                qrcode_path=str(screenshot) if screenshot else None,
+                error_code="continue_publish_stuck",
+                run_id=run_id,
+            )
+        generation = 1
+        page, qrcode_path = self._wait_for_publish_qrcode(
+            context,
+            page,
+            output_dir,
+            run_id=run_id,
+            generation=generation,
+        )
+        if not qrcode_path:
+            screenshot = output_dir / "wechat_publish_verification_not_reached.png"
+            try:
+                page.screenshot(path=str(screenshot), full_page=True)
+            except Exception:
+                screenshot = None
+            return PublishResult(
+                PublishStatus.FAILED,
+                "browser",
+                "已点击继续发表，但未进入微信验证页面，已阻止继续等待",
+                qrcode_path=str(screenshot) if screenshot else None,
+                error_code="publish_verification_not_reached",
+                run_id=run_id,
+            )
+        body = self._body_text(page)
+        stage = self._scan_stage(body)
+        expires_at = time.time() + self.qr_ttl
+        if run_id:
+            return self._scan_result(
+                "请使用微信扫码验证发布",
+                stage=stage,
+                qrcode_path=qrcode_path,
+                run_id=run_id,
+                generation=generation,
+                expires_at=expires_at,
+                error_code="publish_scan_pending",
+            )
+        return self._wait_for_final_result(page, qrcode_path, generation=generation, expires_at=expires_at)
+
+    def _publish_unlocked(self, article: Article, *, confirm_publish: bool = False, run_id: Optional[str] = None) -> PublishResult:
         if not confirm_publish and article.publish:
             return PublishResult(
                 PublishStatus.FAILED,
@@ -1260,105 +1514,11 @@ class BrowserPublisher:
                 self._fill_article(page, article)
                 if not article.publish:
                     return finish(PublishResult(PublishStatus.DRAFT_CREATED, "browser", "文章已填写，未执行发布"))
-                if not self._click_text(page, "发表"):
-                    return finish(PublishResult(PublishStatus.FAILED, "browser", "未找到发表按钮", error_code="publish_button_missing"))
-                page.wait_for_timeout(2500)
-                final_visible = page.locator("button.weui-desktop-btn_primary").filter(has_text="发表").last
-                if not (
-                    self._has_visible_text(page, "继续发表")
-                ) and not final_visible.is_visible(timeout=500):
-                    modal_already_open = any(
-                        self._has_visible_text(page, text)
-                        for text in ("群发通知", "今天还有", "今天没有通知次数", "定时发表")
-                    )
-                    if modal_already_open:
-                        clicked_confirmation = self._click_publish_confirmation(page)
-                    else:
-                        clicked_confirmation = False
-                    if clicked_confirmation:
-                        page.wait_for_timeout(1000)
-                        # The modal was already open, so skip the second click
-                        # below and continue with the continuation action.
-                        pass
-                    else:
-                        # The first click can only save the new article. Once the
-                        # save toast disappears, click the editor publish button
-                        # again to open the group-notification confirmation.
-                        page.locator(".mass_send").click()
-                else:
-                    clicked_confirmation = self._click_publish_confirmation(page)
-                if not clicked_confirmation:
-                    continue_button = page.get_by_role("button", name="继续发表", exact=True)
-                    if continue_button.count() == 1 and continue_button.is_visible(timeout=500):
-                        continue_button.click()
-                        clicked_confirmation = True
-                if not clicked_confirmation:
-                    screenshot = output_dir / "wechat_publish_confirmation_missing.png"
-                    try:
-                        page.screenshot(path=str(screenshot), full_page=True)
-                    except Exception:
-                        screenshot = None
-                    return finish(PublishResult(
-                        PublishStatus.FAILED,
-                        "browser",
-                        "未确认点击发表弹窗，已阻止生成无效验证二维码",
-                        qrcode_path=str(screenshot) if screenshot else None,
-                        error_code="publish_confirmation_missing",
-                    ))
-                page.wait_for_timeout(1000)
-                clicked_continue = self._click_continue_publish(page)
-                page.wait_for_timeout(1000)
-                if not clicked_continue or self._has_visible_text(page, "继续发表"):
-                    screenshot = output_dir / "wechat_publish_confirmation_stuck.png"
-                    try:
-                        page.screenshot(path=str(screenshot), full_page=True)
-                    except Exception:
-                        screenshot = None
-                    return finish(PublishResult(
-                        PublishStatus.FAILED,
-                        "browser",
-                        "继续发表弹窗未关闭，已阻止捕获二维码",
-                        qrcode_path=str(screenshot) if screenshot else None,
-                        error_code="continue_publish_stuck",
-                    ))
-                generation = 1
-                page, qrcode_path = self._wait_for_publish_qrcode(
-                    context,
-                    page,
-                    output_dir,
-                    run_id=run_id,
-                    generation=generation,
-                )
-                if not qrcode_path:
-                    screenshot = output_dir / "wechat_publish_verification_not_reached.png"
-                    try:
-                        page.screenshot(path=str(screenshot), full_page=True)
-                    except Exception:
-                        screenshot = None
-                    return finish(PublishResult(
-                        PublishStatus.FAILED,
-                        "browser",
-                        "已点击继续发表，但未进入微信验证页面，已阻止继续等待",
-                        qrcode_path=str(screenshot) if screenshot else None,
-                        error_code="publish_verification_not_reached",
-                    ))
-                body = self._body_text(page)
-                stage = self._scan_stage(body)
-                expires_at = time.time() + self.qr_ttl
-                if run_id:
-                    result = self._scan_result(
-                        "请使用微信扫码验证发布",
-                        stage=stage,
-                        qrcode_path=qrcode_path,
-                        run_id=run_id,
-                        generation=generation,
-                        expires_at=expires_at,
-                        error_code="publish_scan_pending",
-                    )
-                    result = finish(result)
+                result = self._submit_current_editor(context, page, output_dir, run_id=run_id)
+                result = finish(result)
+                if run_id and result.status is PublishStatus.AWAITING_SCAN:
                     self._start_watcher(run_id)
-                    return result
-                return finish(self._wait_for_final_result(page, qrcode_path, generation=generation, expires_at=expires_at))
+                return result
             except Exception as exc:
                 screenshot = output_dir / "wechat_publish_error.png"
                 try:

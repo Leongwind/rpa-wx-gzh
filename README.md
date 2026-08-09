@@ -23,7 +23,7 @@
 $CODEX_HOME/skills/wechat-mp-publisher/SKILL.md
 ```
 
-也可以在 Codex 中直接使用 `$wechat-mp-publisher` 调用它。Skill 的实现代码仍然在本仓库中，建议始终在本项目目录下使用，避免调用到旧的 Selenium 流程。
+也可以在 Codex 中直接使用 `$wechat-mp-publisher` 调用它。Skill 会优先从当前 Codex 工作区寻找本仓库；如果仓库不在当前目录，可以设置 `WX_GZH_ROOT`。可编辑安装 `pip install -e .` 后，也可以从其他目录使用 `wechat-publisher` 命令。
 
 ### 2. 创建独立的 Anaconda 环境
 
@@ -36,6 +36,7 @@ cd rpa-wx-gzh
 conda env create --override-channels -f environment.yml
 conda activate rpa-wx-gzh
 python -m playwright install chromium
+python -m pip install -e .
 ```
 
 确认当前 Python 来自该环境：
@@ -109,6 +110,10 @@ Skill 适合自然语言调用；需要批量处理或精确复现时，也可�
   "body": "正文内容\n\n![正文图片]({{asset:image1}})",
   "body_format": "markdown",
   "digest": "可选摘要",
+  "author": "可选作者",
+  "source_url": "https://example.com/source",
+  "need_open_comment": false,
+  "only_fans_can_comment": false,
   "cover_image": "/absolute/path/cover.png",
   "assets": [
     {"alias": "image1", "path": "/absolute/path/body.png"}
@@ -125,6 +130,10 @@ Skill 适合自然语言调用；需要批量处理或精确复现时，也可�
 | `body` | 必填，正文；默认 Markdown |
 | `body_format` | `markdown` 或 `html` |
 | `digest` | 可选；省略时自动提取正文前 120 个字符 |
+| `author` | 可选作者；API 通道支持 |
+| `source_url` | 可选原文链接；API 通道支持 |
+| `need_open_comment` | 是否开启留言；API 通道支持 |
+| `only_fans_can_comment` | 是否仅粉丝可留言；API 通道支持 |
 | `cover_image` | 可选的本地封面绝对路径 |
 | `assets` | 正文图片列表，`alias` 必须与正文占位符一致 |
 | `publish` | 草稿使用 `false`；正式发布使用 `true`，并且还必须传 `--confirm-publish` |
@@ -145,6 +154,30 @@ python -m wechat_publisher publish \
   --json
 ```
 
+如果准备和正式发布之间会间隔较长，建议使用两阶段流程。第一步只创建草稿并返回 `run_id`；第二步会重新打开保存的草稿、校验内容，再进入发表确认，不依赖之前一直打开的编辑页面：
+
+```bash
+python -m wechat_publisher publish \
+  --input article.json \
+  --mode draft \
+  --json
+
+python -m wechat_publisher publish \
+  --run-id <run-id> \
+  --confirm-publish \
+  --json
+```
+
+正式发布前可以只查看摘要，不打开浏览器、不调用 API：
+
+```bash
+python -m wechat_publisher publish \
+  --input article.json \
+  --mode auto \
+  --preview \
+  --json
+```
+
 ### 自动选择 API 或浏览器发布
 
 ```bash
@@ -156,6 +189,17 @@ python -m wechat_publisher publish \
 ```
 
 如果没有 API 凭证，或 API 通道不可用，`auto` 会回退到浏览器通道。API 已经提交但结果未知时不会自动回退浏览器，以避免重复发布。
+
+同一篇文章如果已经有运行中的发布会话、未知结果或已确认发布记录，系统会默认阻止再次发布。确认公众号后台没有重复发布后，确实需要再次发送时才使用：
+
+```bash
+python -m wechat_publisher publish \
+  --input article.json \
+  --mode auto \
+  --confirm-publish \
+  --force-republish \
+  --json
+```
 
 ### 指定通道
 
@@ -198,6 +242,7 @@ python -m wechat_publisher publish \
 python -m wechat_publisher status --run-id <run-id> --json
 python -m wechat_publisher resume --run-id <run-id> --json
 python -m wechat_publisher cancel --run-id <run-id> --json
+python -m wechat_publisher cleanup --older-than 604800 --json
 ```
 
 二维码按 `run_id + generation` 生成。二维码过期时最多自动刷新一次，只刷新当前验证挑战，不会再次点击“发表”或重复提交文章。
@@ -235,6 +280,7 @@ export WX_QR_REFRESH_LIMIT="1"
 ```
 
 不要把正在运行的 Chrome/Edge 用户目录设置为 `WX_PLAYWRIGHT_PROFILE`，否则可能产生配置文件锁冲突。项目会使用独立目录。
+同一个 Playwright profile 同时只能运行一个发布任务；如果返回 `profile_busy`，先等待已有任务结束，或为不同账号设置不同的 profile 目录。
 
 ## 常见问题
 

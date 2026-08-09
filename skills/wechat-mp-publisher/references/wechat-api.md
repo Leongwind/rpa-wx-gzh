@@ -8,6 +8,11 @@ The API adapter uses the Official Account endpoints for:
 - `cgi-bin/draft/add` to create an article draft;
 - `cgi-bin/freepublish/submit` and `cgi-bin/freepublish/get` to submit and poll publication.
 
+The draft payload also supports the safe subset of article metadata exposed by
+this publisher: `author`, `content_source_url`, `need_open_comment`, and
+`only_fans_can_comment`. The browser fallback reports these options as
+unsupported instead of silently dropping them.
+
 The account must have the corresponding Official Account API permissions. API
 errors before submission may fall back to the browser provider in `auto` mode.
 After submission, the publisher returns `unknown` on an ambiguous result and

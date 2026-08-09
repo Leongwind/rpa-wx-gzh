@@ -15,4 +15,5 @@ wechat_*_qrcode.png
 wechat_*_full.png
 __pycache__/
 **/__pycache__/
+*.egg-info/
 .pytest_cache/

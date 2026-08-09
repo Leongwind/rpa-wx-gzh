@@ -57,6 +57,14 @@ def test_article_derives_digest_and_uses_first_asset_as_cover(tmp_path: Path):
     assert article.digest.startswith("动态标题 这是用户提供的正文")
 
 
+def test_article_defaults_to_draft_and_fingerprint_changes_with_metadata(tmp_path: Path):
+    article = Article.from_dict({"title": "安全默认", "body": "正文"})
+    with_author = Article.from_dict({"title": "安全默认", "body": "正文", "author": "作者"})
+
+    assert article.publish is False
+    assert article.fingerprint() != with_author.fingerprint()
+
+
 def test_asset_is_not_inserted_without_an_explicit_body_reference(tmp_path: Path):
     image = tmp_path / "attached.png"
     image.write_bytes(b"png")
