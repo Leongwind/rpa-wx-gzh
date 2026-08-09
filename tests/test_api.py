@@ -108,3 +108,26 @@ def test_api_maps_article_metadata_to_draft_payload(tmp_path: Path):
     assert payload["content_source_url"] == "https://example.test/source"
     assert payload["need_open_comment"] == 1
     assert payload["only_fans_can_comment"] == 1
+
+
+def test_api_refreshes_expired_token_before_non_submit_request():
+    class ExpiredTokenSession:
+        def __init__(self):
+            self.calls = []
+            self.expired = True
+
+        def request(self, method, url, timeout, **kwargs):
+            self.calls.append(url)
+            if "/cgi-bin/token" in url:
+                return FakeResponse({"access_token": "fresh-token"})
+            if self.expired:
+                self.expired = False
+                return FakeResponse({"errcode": 42001, "errmsg": "expired"})
+            return FakeResponse({"ok": True})
+
+    session = ExpiredTokenSession()
+    api = WeChatAPI("appid", "secret", session=session)
+    api._access_token = "old-token"
+
+    assert api._request("GET", "/cgi-bin/draft/get", params={"access_token": "old-token"}) == {"ok": True}
+    assert any("fresh-token" in url for url in session.calls)

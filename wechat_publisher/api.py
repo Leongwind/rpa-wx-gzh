@@ -68,7 +68,15 @@ class WeChatAPI:
             )
         return payload
 
-    def _request(self, method: str, path: str, *, params: Optional[Dict[str, str]] = None, **kwargs: Any) -> Mapping[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, str]] = None,
+        _token_retry: bool = False,
+        **kwargs: Any,
+    ) -> Mapping[str, Any]:
         retryable = path != "/cgi-bin/freepublish/submit"
         last_error: Optional[Exception] = None
         for attempt in range(3 if retryable else 1):
@@ -86,7 +94,27 @@ class WeChatAPI:
                     raise last_error
                 time.sleep(0.5 * (2**attempt))
                 continue
-            return self._json_response(response)
+            try:
+                return self._json_response(response)
+            except WeChatAPIError as exc:
+                if (
+                    exc.code in {"40001", "40014", "42001"}
+                    and not _token_retry
+                    and path != "/cgi-bin/freepublish/submit"
+                    and params
+                    and "access_token" in params
+                ):
+                    refreshed_params = dict(params)
+                    self._access_token = None
+                    refreshed_params["access_token"] = self.access_token()
+                    return self._request(
+                        method,
+                        path,
+                        params=refreshed_params,
+                        _token_retry=True,
+                        **kwargs,
+                    )
+                raise
         raise WeChatAPIError(f"微信 API 请求失败: {_redact(str(last_error))}")
 
     def access_token(self) -> str:
